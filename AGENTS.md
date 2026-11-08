@@ -1,0 +1,1 @@
+Whenever you implement things, don't forget to consider performance optimization.

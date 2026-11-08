@@ -1,0 +1,1 @@
+"""Bomberman RL Environment."""

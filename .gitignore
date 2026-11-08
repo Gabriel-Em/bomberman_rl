@@ -218,3 +218,27 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# Bomberman RL Artifacts & Weights
+*.pt
+*.pth
+*.ckpt
+checkpoints/*
+!checkpoints/.gitkeep
+replays/*.npz
+!replays/test_match.npz
+!replays/.gitkeep
+
+# Training Archives
+archives/*
+!archives/.gitkeep
+archive/*
+!archive/.gitkeep
+*.tar.gz
+*.zip
+*.tar
+
+
