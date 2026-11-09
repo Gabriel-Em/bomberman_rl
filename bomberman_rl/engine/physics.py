@@ -367,7 +367,38 @@ class BombermanPhysics:
                 bomb.velocity_r = ir
                 bomb.velocity_c = ic
 
+        tr = max(0, min(GRID_SIZE - 1, int(np.floor(player.r))))
+        tc = max(0, min(GRID_SIZE - 1, int(np.floor(player.c))))
+        center_r = tr + 0.5
+        center_c = tc + 0.5
+
         if move_act == MoveAction.UP:
+            adj_r = tr - 1
+            adj_c = tc
+            obs, b = BombermanPhysics.is_tile_obstacle_for_player(player, adj_r, adj_c, state)
+            if obs:
+                can_kick = (b is not None and player.can_kick and (b.velocity_r == 0.0 and b.velocity_c == 0.0))
+                if can_kick:
+                    record_kick(b, -0.25, 0.0)
+                if player.r <= center_r + 1e-7:
+                    if abs(player.r - center_r) < 1e-5:
+                        player.r = center_r
+                    return
+                else:
+                    player.r = max(player.r - step_dist, center_r)
+                    diff_c = center_c - player.c
+                    if abs(diff_c) > 1e-7:
+                        player.c += np.sign(diff_c) * min(step_dist, abs(diff_c))
+                        if abs(player.c - center_c) < 1e-5:
+                            player.c = center_c
+                    return
+
+            diff_c = center_c - player.c
+            if abs(diff_c) > 1e-7:
+                player.c += np.sign(diff_c) * min(step_dist, abs(diff_c))
+                if abs(player.c - center_c) < 1e-5:
+                    player.c = center_c
+
             dr = -step_dist
             target_r = player.r + dr
             if target_r - PLAYER_HALF_SIZE < 0:
@@ -437,6 +468,32 @@ class BombermanPhysics:
                     player.r = target_r
 
         elif move_act == MoveAction.DOWN:
+            adj_r = tr + 1
+            adj_c = tc
+            obs, b = BombermanPhysics.is_tile_obstacle_for_player(player, adj_r, adj_c, state)
+            if obs:
+                can_kick = (b is not None and player.can_kick and (b.velocity_r == 0.0 and b.velocity_c == 0.0))
+                if can_kick:
+                    record_kick(b, 0.25, 0.0)
+                if player.r >= center_r - 1e-7:
+                    if abs(player.r - center_r) < 1e-5:
+                        player.r = center_r
+                    return
+                else:
+                    player.r = min(player.r + step_dist, center_r)
+                    diff_c = center_c - player.c
+                    if abs(diff_c) > 1e-7:
+                        player.c += np.sign(diff_c) * min(step_dist, abs(diff_c))
+                        if abs(player.c - center_c) < 1e-5:
+                            player.c = center_c
+                    return
+
+            diff_c = center_c - player.c
+            if abs(diff_c) > 1e-7:
+                player.c += np.sign(diff_c) * min(step_dist, abs(diff_c))
+                if abs(player.c - center_c) < 1e-5:
+                    player.c = center_c
+
             dr = step_dist
             target_r = player.r + dr
             if target_r + PLAYER_HALF_SIZE > GRID_SIZE:
@@ -506,6 +563,32 @@ class BombermanPhysics:
                     player.r = target_r
 
         elif move_act == MoveAction.LEFT:
+            adj_r = tr
+            adj_c = tc - 1
+            obs, b = BombermanPhysics.is_tile_obstacle_for_player(player, adj_r, adj_c, state)
+            if obs:
+                can_kick = (b is not None and player.can_kick and (b.velocity_r == 0.0 and b.velocity_c == 0.0))
+                if can_kick:
+                    record_kick(b, 0.0, -0.25)
+                if player.c <= center_c + 1e-7:
+                    if abs(player.c - center_c) < 1e-5:
+                        player.c = center_c
+                    return
+                else:
+                    player.c = max(player.c - step_dist, center_c)
+                    diff_r = center_r - player.r
+                    if abs(diff_r) > 1e-7:
+                        player.r += np.sign(diff_r) * min(step_dist, abs(diff_r))
+                        if abs(player.r - center_r) < 1e-5:
+                            player.r = center_r
+                    return
+
+            diff_r = center_r - player.r
+            if abs(diff_r) > 1e-7:
+                player.r += np.sign(diff_r) * min(step_dist, abs(diff_r))
+                if abs(player.r - center_r) < 1e-5:
+                    player.r = center_r
+
             dc = -step_dist
             target_c = player.c + dc
             if target_c - PLAYER_HALF_SIZE < 0:
@@ -575,6 +658,32 @@ class BombermanPhysics:
                     player.c = target_c
 
         elif move_act == MoveAction.RIGHT:
+            adj_r = tr
+            adj_c = tc + 1
+            obs, b = BombermanPhysics.is_tile_obstacle_for_player(player, adj_r, adj_c, state)
+            if obs:
+                can_kick = (b is not None and player.can_kick and (b.velocity_r == 0.0 and b.velocity_c == 0.0))
+                if can_kick:
+                    record_kick(b, 0.0, 0.25)
+                if player.c >= center_c - 1e-7:
+                    if abs(player.c - center_c) < 1e-5:
+                        player.c = center_c
+                    return
+                else:
+                    player.c = min(player.c + step_dist, center_c)
+                    diff_r = center_r - player.r
+                    if abs(diff_r) > 1e-7:
+                        player.r += np.sign(diff_r) * min(step_dist, abs(diff_r))
+                        if abs(player.r - center_r) < 1e-5:
+                            player.r = center_r
+                    return
+
+            diff_r = center_r - player.r
+            if abs(diff_r) > 1e-7:
+                player.r += np.sign(diff_r) * min(step_dist, abs(diff_r))
+                if abs(player.r - center_r) < 1e-5:
+                    player.r = center_r
+
             dc = step_dist
             target_c = player.c + dc
             if target_c + PLAYER_HALF_SIZE > GRID_SIZE:

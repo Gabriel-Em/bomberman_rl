@@ -98,3 +98,46 @@ def archive_training_data(
         "archive_tar": tar_path if create_compressed else None,
         "files": moved_files,
     }
+
+
+def clean_training_data(
+    checkpoint_dir: str = "./checkpoints",
+    replays_dir: str = "./replays",
+    keep_samples: tuple[str, ...] = ("test_match.npz", ".gitkeep"),
+) -> dict[str, Any]:
+    """Remove training checkpoints and showcase replays to prepare clean directories for a fresh run.
+
+    Deletes past training artifacts from active working directories while preserving essential
+    fixtures and version-controlled placeholders.
+
+    Args:
+        checkpoint_dir: Path to model checkpoints directory.
+        replays_dir: Path to match replays directory.
+        keep_samples: Filenames to preserve in source directories (e.g., fixtures, .gitkeep).
+
+    Returns:
+        Dict detailing cleaning status, removed file count, and list of removed file paths.
+    """
+    removed_files: list[str] = []
+
+    for target_dir in (checkpoint_dir, replays_dir):
+        if not os.path.isdir(target_dir):
+            continue
+        for fname in sorted(os.listdir(target_dir)):
+            if fname in keep_samples or fname.startswith("."):
+                continue
+            path = os.path.join(target_dir, fname)
+            if os.path.isfile(path) or os.path.islink(path):
+                os.remove(path)
+                removed_files.append(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+                removed_files.append(path)
+
+    return {
+        "cleaned": len(removed_files) > 0,
+        "files_count": len(removed_files),
+        "checkpoint_dir": checkpoint_dir,
+        "replays_dir": replays_dir,
+        "files": removed_files,
+    }

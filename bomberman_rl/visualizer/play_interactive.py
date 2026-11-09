@@ -38,7 +38,12 @@ from bomberman_rl.engine.physics import BombermanPhysics
 from bomberman_rl.rl.observation import ObservationBuilder, compute_danger_map
 from bomberman_rl.rl.rewards import RewardTracker
 from bomberman_rl.rl.action_filter import SafetyActionFilter
-from bomberman_rl.replays.recorder import ReplayRecorder, ReplayEpisode
+from bomberman_rl.replays.recorder import (
+    ReplayRecorder,
+    ReplayEpisode,
+    find_latest_replay,
+    list_replays,
+)
 from bomberman_rl.visualizer.renderer import Renderer
 
 
@@ -162,6 +167,7 @@ def run_interactive(
     playback_speed: float = 1.0,
     headless: bool = False,
     max_ticks: int = MAX_TICKS,
+    replays_dir: str = "./replays",
 ) -> None:
     """Run interactive visual loop for live gameplay or replay inspection."""
     renderer = Renderer(title=f"Bomberman MARL - {mode.upper()}", headless=headless)
@@ -169,7 +175,13 @@ def run_interactive(
 
     # --- Mode: Replay Forensic Analyzer ---
     if mode == "replay":
-        if not replay_path or not os.path.isfile(replay_path):
+        if replay_path is None or replay_path == "latest":
+            latest = find_latest_replay(replays_dir)
+            if latest is None:
+                raise FileNotFoundError(f"No replay files (.npz) found in '{replays_dir}'.")
+            replay_path = latest
+
+        if not os.path.isfile(replay_path):
             raise FileNotFoundError(f"Replay archive not found: {replay_path}")
 
         episode = ReplayEpisode.load(replay_path)
@@ -193,8 +205,10 @@ def run_interactive(
             if inp["seek_tick"] is not None:
                 ratio = inp["seek_tick"]
                 curr_frame_idx = int(np.clip(round(ratio * (total_frames - 1)), 0, total_frames - 1))
+                subtick_accum = 0.0
             elif inp["step"] != 0:
                 curr_frame_idx = int(np.clip(curr_frame_idx + inp["step"], 0, total_frames - 1))
+                subtick_accum = 0.0
 
             # Playback advance
             if not renderer.paused:
@@ -219,6 +233,8 @@ def run_interactive(
                 events=episode.events,
                 interp_alpha=float(np.clip(subtick_accum, 0.0, 1.0)),
                 total_ticks=total_frames,
+                tick_limit=episode.metadata.get("max_episode_ticks"),
+                end_reason=episode.metadata.get("end_reason"),
             )
 
         pygame.quit()
@@ -385,7 +401,8 @@ def main() -> None:
         default="agent_vs_agent",
         help="Interactive playback mode",
     )
-    parser.add_argument("--replay", type=str, default=None, help="Path to .npz replay trajectory")
+    parser.add_argument("--replay", type=str, default=None, help="Path to .npz replay trajectory (default: latest in replays-dir)")
+    parser.add_argument("--replays-dir", type=str, default="./replays", help="Directory to search for replays (default: ./replays)")
     parser.add_argument("--record", type=str, default=None, help="Path to record match trajectory")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed")
     parser.add_argument("--speed", type=float, default=1.0, help="Initial playback speed")
@@ -402,6 +419,7 @@ def main() -> None:
         playback_speed=args.speed,
         headless=args.headless,
         max_ticks=args.max_ticks,
+        replays_dir=args.replays_dir,
     )
 
 

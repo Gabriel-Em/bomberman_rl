@@ -13,6 +13,41 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 
+class ActionEntropy:
+    """Encapsulates movement and bomb entropy with custom head weighting."""
+
+    def __init__(self, move_entropy: torch.Tensor, bomb_entropy: torch.Tensor) -> None:
+        self.move = move_entropy
+        self.bomb = bomb_entropy
+
+    def weighted_loss(self, coef_move: float = 0.005, coef_bomb: float = 0.01) -> torch.Tensor:
+        return -(coef_move * self.move.mean() + coef_bomb * self.bomb.mean())
+
+    def mean(self) -> torch.Tensor:
+        return (self.move + self.bomb).mean()
+
+    def __add__(self, other: Any) -> torch.Tensor:
+        return (self.move + self.bomb) + other
+
+    def __radd__(self, other: Any) -> torch.Tensor:
+        return other + (self.move + self.bomb)
+
+    def __mul__(self, other: Any) -> torch.Tensor:
+        return (self.move + self.bomb) * other
+
+    def __rmul__(self, other: Any) -> torch.Tensor:
+        return other * (self.move + self.bomb)
+
+    def __neg__(self) -> torch.Tensor:
+        return -(self.move + self.bomb)
+
+    def __sub__(self, other: Any) -> torch.Tensor:
+        return (self.move + self.bomb) - other
+
+    def __rsub__(self, other: Any) -> torch.Tensor:
+        return other - (self.move + self.bomb)
+
+
 class ResidualBlock(nn.Module):
     """Residual convolutional block with 3x3 convs, GroupNorm, and ReLU."""
 
@@ -93,6 +128,41 @@ class ActorCriticNetwork(nn.Module):
         nn.init.orthogonal_(self.bomb_head.weight, gain=0.01)
         nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
 
+        # Bomb head bias initialization: [1.0, -1.0] (~73% NO_BOMB, ~27% PLACE_BOMB)
+        with torch.no_grad():
+            self.bomb_head.bias.copy_(torch.tensor([1.0, -1.0]))
+
+    @staticmethod
+    def _detect_near_brick_safe(spatial: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
+        """Detect if player is on a safe tile adjacent to breakable brick with 0 active bombs."""
+        B = spatial.shape[0]
+        device = spatial.device
+        if spatial.shape[1] < 16 or scalars.shape[1] < 5:
+            return torch.zeros(B, dtype=torch.bool, device=device)
+
+        zero_bombs = (scalars[:, 4] < 1e-4)
+        player_pos = spatial[:, 15]
+
+        # Danger at player position
+        if spatial.shape[1] > 8:
+            danger = spatial[:, 8]
+            safe_tile = ((danger * player_pos).sum(dim=(-2, -1)) < 1e-4)
+        else:
+            safe_tile = torch.ones(B, dtype=torch.bool, device=device)
+
+        # Adjacent breakable brick
+        brick = spatial[:, 2]
+        padded = F.pad(brick, (1, 1, 1, 1), mode="constant", value=0.0)
+        adj_bricks = (
+            padded[:, :-2, 1:-1]
+            + padded[:, 2:, 1:-1]
+            + padded[:, 1:-1, :-2]
+            + padded[:, 1:-1, 2:]
+        )
+        has_adj_brick = ((adj_bricks * player_pos).sum(dim=(-2, -1)) > 0.5)
+
+        return zero_bombs & safe_tile & has_adj_brick
+
     def extract_features(self, spatial: torch.Tensor, scalars: torch.Tensor) -> torch.Tensor:
         """Fuse spatial convolutional representation and scalar embedding."""
         x_spatial = F.relu(self.conv_in(spatial))
@@ -163,6 +233,18 @@ class ActorCriticNetwork(nn.Module):
                 bomb_mask = bomb_mask.to(device=device, dtype=torch.bool)
             if bomb_mask.dim() == 1:
                 bomb_mask = bomb_mask.unsqueeze(0)
+
+            # Minimum Bomb Exploration Floor:
+            # Set exploration logit floor to -4.0 (~1.8%/tick) normally, and -2.2 (~10%/tick)
+            # specifically when player is on a safe tile adjacent to a breakable brick with active_bombs == 0.
+            can_bomb = bomb_mask[..., 1]
+            if can_bomb.any():
+                near_brick_safe = self._detect_near_brick_safe(spatial, scalars)
+                floor_offset = torch.where(near_brick_safe, -2.2, -4.0)
+                floor_1 = bomb_logits[..., 0] + floor_offset
+                bomb_logits_1 = torch.where(can_bomb, torch.maximum(bomb_logits[..., 1], floor_1), bomb_logits[..., 1])
+                bomb_logits = torch.stack([bomb_logits[..., 0], bomb_logits_1], dim=-1)
+
             bomb_logits = bomb_logits.masked_fill(~bomb_mask, -1e8)
 
         move_dist = Categorical(logits=move_logits)
@@ -211,6 +293,16 @@ class ActorCriticNetwork(nn.Module):
             bomb_mask = bomb_mask.to(device=device, dtype=torch.bool)
             if bomb_mask.dim() == 1:
                 bomb_mask = bomb_mask.unsqueeze(0)
+
+            # Minimum Bomb Exploration Floor
+            can_bomb = bomb_mask[..., 1]
+            if can_bomb.any():
+                near_brick_safe = self._detect_near_brick_safe(spatial, scalars)
+                floor_offset = torch.where(near_brick_safe, -2.2, -4.0)
+                floor_1 = bomb_logits[..., 0] + floor_offset
+                bomb_logits_1 = torch.where(can_bomb, torch.maximum(bomb_logits[..., 1], floor_1), bomb_logits[..., 1])
+                bomb_logits = torch.stack([bomb_logits[..., 0], bomb_logits_1], dim=-1)
+
             bomb_logits = bomb_logits.masked_fill(~bomb_mask, -1e8)
 
         move_dist = Categorical(logits=move_logits)
@@ -220,7 +312,7 @@ class ActorCriticNetwork(nn.Module):
         bomb_act = actions[..., 1]
 
         log_probs = move_dist.log_prob(move_act) + bomb_dist.log_prob(bomb_act)
-        entropy = move_dist.entropy() + bomb_dist.entropy()
+        entropy = ActionEntropy(move_dist.entropy(), bomb_dist.entropy())
 
         return log_probs, entropy, values
 

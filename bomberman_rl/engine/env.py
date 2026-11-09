@@ -25,8 +25,9 @@ class BombermanEnv(gym.Env):
 
     metadata = {"render_modes": ["headless"], "render_fps": 20}
 
-    def __init__(self, seed: int | None = None) -> None:
+    def __init__(self, seed: int | None = None, max_ticks: int = MAX_TICKS) -> None:
         super().__init__()
+        self.max_ticks = max_ticks
         self.state: GameState = GameState.create_initial(seed)
 
         # MultiDiscrete([5, 2]): 5 move actions (0: NOOP, 1: UP, 2: DOWN, 3: LEFT, 4: RIGHT),
@@ -98,12 +99,13 @@ class BombermanEnv(gym.Env):
             "tick": self.state.tick,
         }
 
-    def _get_info(self, winner: int | None, draw: bool) -> dict[str, Any]:
+    def _get_info(self, winner: int | None, draw: bool, truncated: bool = False) -> dict[str, Any]:
         p0 = self.state.players[0]
         p1 = self.state.players[1]
         return {
             "winner": winner,
             "draw": draw,
+            "truncated": truncated,
             "tick": self.state.tick,
             "p0_alive": p0.alive,
             "p1_alive": p1.alive,
@@ -175,7 +177,7 @@ class BombermanEnv(gym.Env):
             terminated = True
             winner = 1
             rewards = {"player_0": -1.0, "player_1": 1.0}
-        elif self.state.tick >= MAX_TICKS:
+        elif self.state.tick >= self.max_ticks:
             # Tick limit reached with both players alive -> Draw
             truncated = True
             winner = None
@@ -183,5 +185,8 @@ class BombermanEnv(gym.Env):
             rewards = {"player_0": 0.0, "player_1": 0.0}
 
         obs = self._get_obs()
-        info = self._get_info(winner=winner, draw=draw)
+        # Only a shortened (curriculum) horizon is an artificial truncation; the
+        # full MAX_TICKS limit is a genuine terminal draw.
+        artificial_truncation = truncated and self.max_ticks < MAX_TICKS
+        info = self._get_info(winner=winner, draw=draw, truncated=artificial_truncation)
         return obs, rewards, terminated, truncated, info

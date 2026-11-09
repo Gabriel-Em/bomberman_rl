@@ -6,7 +6,12 @@ import argparse
 import sys
 import torch
 
-from bomberman_rl.training import PPOTrainer, ActorCriticNetwork, archive_training_data
+from bomberman_rl.training import (
+    PPOTrainer,
+    ActorCriticNetwork,
+    archive_training_data,
+    clean_training_data,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -15,6 +20,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--total-generations",
+        "--generations",
+        dest="total_generations",
         type=int,
         default=500,
         help="Total self-play training generations (default: 500)",
@@ -28,8 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rollout-steps",
         type=int,
-        default=128,
-        help="Rollout steps per environment per generation (default: 128)",
+        default=512,
+        help="Rollout steps per environment per generation (default: 512)",
     )
     parser.add_argument(
         "--lr",
@@ -82,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         "--resume",
         type=str,
         default=None,
-        help="Resume training from checkpoint file path or 'latest' (default: None)",
+        help="Resume training from checkpoint file path or 'latest'. If not specified, unarchived training data from stopped runs is removed to start clean (default: None)",
     )
     parser.add_argument(
         "--archive-first",
@@ -90,10 +97,21 @@ def parse_args() -> argparse.Namespace:
         help="Archive existing checkpoints and replays before starting new training (default: False)",
     )
     parser.add_argument(
+        "--reset-checkpoints",
+        action="store_true",
+        help="Reset and remove all existing checkpoints and replays, starting fresh from Gen 0 (default: False)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
         help="Random seed (default: 42)",
+    )
+    parser.add_argument(
+        "--show-telemetry",
+        action="store_true",
+        default=False,
+        help="Show detailed telemetry diagnostics tables during training (default: False, hidden)",
     )
     return parser.parse_args()
 
@@ -101,17 +119,43 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    if args.archive_first:
-        res = archive_training_data(
-            checkpoint_dir=args.checkpoint_dir,
-            replays_dir=args.replays_dir,
-        )
-        if res["archived"]:
-            print(f"Archived previous training data ({res['files_count']} files) to {res['archive_dir']}")
-            if res["archive_tar"]:
-                print(f"Compressed bundle: {res['archive_tar']}")
+    if args.resume is None:
+        if args.archive_first:
+            res = archive_training_data(
+                checkpoint_dir=args.checkpoint_dir,
+                replays_dir=args.replays_dir,
+            )
+            if res["archived"]:
+                print(f"Archived previous training data ({res['files_count']} files) to {res['archive_dir']}")
+                if res["archive_tar"]:
+                    print(f"Compressed bundle: {res['archive_tar']}")
+            else:
+                print("No previous training data found to archive.")
         else:
-            print("No previous training data found to archive.")
+            res = clean_training_data(
+                checkpoint_dir=args.checkpoint_dir,
+                replays_dir=args.replays_dir,
+            )
+            if res["cleaned"]:
+                print(f"Removed previous training data ({res['files_count']} files) to ensure clean directories for new training.")
+    else:
+        if args.reset_checkpoints:
+            args.resume = None
+            res = clean_training_data(
+                checkpoint_dir=args.checkpoint_dir,
+                replays_dir=args.replays_dir,
+            )
+            if res["cleaned"]:
+                print(f"Reset: removed previous training data ({res['files_count']} files).")
+        elif args.archive_first:
+            res = archive_training_data(
+                checkpoint_dir=args.checkpoint_dir,
+                replays_dir=args.replays_dir,
+            )
+            if res["archived"]:
+                print(f"Archived previous training data ({res['files_count']} files) to {res['archive_dir']}")
+                if res["archive_tar"]:
+                    print(f"Compressed bundle: {res['archive_tar']}")
 
     trainer = PPOTrainer(
         num_envs=args.num_envs,
@@ -126,6 +170,7 @@ def main() -> int:
         device=args.device,
         use_async=not args.sync,
         seed=args.seed,
+        show_telemetry=args.show_telemetry,
     )
 
     if args.resume is not None:

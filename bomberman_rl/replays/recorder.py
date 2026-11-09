@@ -230,6 +230,7 @@ class ReplayEpisode:
         def make_rew_dict(arr: np.ndarray) -> dict[str, float]:
             return {name: float(arr[i]) for i, name in enumerate(REWARD_COMPONENT_NAMES)}
 
+        start_hist = max(0, t - 199)
         return {
             "tick": int(self.ticks[t]),
             "progress_ratio": self.get_progress_ratio(t),
@@ -241,6 +242,8 @@ class ReplayEpisode:
             "action_probs_p1": self.action_probs_p1[t].copy(),
             "value_p0": float(self.critic_values[t, 0]),
             "value_p1": float(self.critic_values[t, 1]),
+            "value_history_p0": self.critic_values[start_hist : t + 1, 0].tolist(),
+            "value_history_p1": self.critic_values[start_hist : t + 1, 1].tolist(),
             "rewards_p0": make_rew_dict(self.rewards_p0[t]),
             "rewards_p1": make_rew_dict(self.rewards_p1[t]),
             "cumulative_rewards_p0": make_rew_dict(self.cumulative_rewards_p0[t]),
@@ -627,18 +630,37 @@ class ReplayRecorder:
             elif curr_p.bomb_pass and not prev_p.bomb_pass:
                 self.events.append(GameEvent(tick=tick, event_type="powerup_pickup", description=f"P{pid} collected Bomb Pass", player_id=pid, tile=curr_p.tile))
 
-        # Brick breaches / destructions
-        bricks_destroyed = 0
-        for r in range(GRID_SIZE):
-            for c in range(GRID_SIZE):
-                if self._prev_state.grid[r, c] == TileType.BRICK and curr_state.grid[r, c] == TileType.EMPTY:
-                    bricks_destroyed += 1
-        if bricks_destroyed > 0:
+        # Brick breaches / destructions, attributed to the owner of the flame
+        bricks_by_owner = [0, 0]
+        bricks_unattributed = 0
+        broken = (self._prev_state.grid == TileType.BRICK) & (curr_state.grid == TileType.EMPTY)
+        for r, c in zip(*np.nonzero(broken)):
+            mask = int(curr_state.flame_owner_mask[r, c])
+            if mask & 1:
+                bricks_by_owner[0] += 1
+            if mask & 2:
+                bricks_by_owner[1] += 1
+            if mask == 0:
+                bricks_unattributed += 1
+        for pid in (0, 1):
+            if bricks_by_owner[pid] > 0:
+                n = bricks_by_owner[pid]
+                self.events.append(
+                    GameEvent(
+                        tick=tick,
+                        event_type="brick_destroyed",
+                        description=f"P{pid} destroyed {n} brick(s)",
+                        player_id=pid,
+                        data={"count": n},
+                    )
+                )
+        if bricks_unattributed > 0:
             self.events.append(
                 GameEvent(
                     tick=tick,
                     event_type="brick_destroyed",
-                    description=f"{bricks_destroyed} brick(s) destroyed",
+                    description=f"{bricks_unattributed} brick(s) destroyed",
+                    data={"count": bricks_unattributed},
                 )
             )
 
@@ -730,3 +752,50 @@ class ReplayRecorder:
     def load(cls, path: str) -> ReplayEpisode:
         """Direct load convenience method."""
         return ReplayEpisode.load(path)
+
+
+def list_replays(replays_dir: str = "./replays") -> list[str]:
+    """Return all .npz replay file paths in replays_dir sorted newest first by modification time."""
+    if not os.path.isdir(replays_dir):
+        return []
+    replays = [
+        os.path.abspath(os.path.join(replays_dir, f))
+        for f in os.listdir(replays_dir)
+        if f.endswith(".npz") and os.path.isfile(os.path.join(replays_dir, f))
+    ]
+    replays.sort(key=lambda p: (os.path.getmtime(p), p), reverse=True)
+    return replays
+
+
+def find_latest_replay(replays_dir: str = "./replays") -> str | None:
+    """Find the most recently modified .npz replay file in replays_dir, or None if none found."""
+    replays = list_replays(replays_dir)
+    return replays[0] if replays else None
+
+
+def cleanup_replays(replays_dir: str = "./replays", max_replays: int = 50) -> list[str]:
+    """Keeps only the `max_replays` most recent .npz files in replays_dir, deleting the oldest ones.
+
+    Args:
+        replays_dir: Directory containing .npz replay files.
+        max_replays: Maximum number of recent replay files to retain.
+
+    Returns:
+        List of deleted file paths.
+    """
+    if not os.path.isdir(replays_dir):
+        return []
+    replays = list_replays(replays_dir)
+    if len(replays) <= max_replays:
+        return []
+    to_delete = replays[max_replays:]
+    deleted: list[str] = []
+    for path in to_delete:
+        try:
+            os.remove(path)
+            deleted.append(path)
+        except OSError:
+            pass
+    return deleted
+
+

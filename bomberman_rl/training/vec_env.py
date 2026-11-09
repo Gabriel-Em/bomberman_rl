@@ -14,6 +14,7 @@ import torch
 
 from bomberman_rl.engine.config import (
     GRID_SIZE,
+    MAX_TICKS,
     TileType,
     PowerUpType,
     MoveAction,
@@ -21,10 +22,17 @@ from bomberman_rl.engine.config import (
 )
 from bomberman_rl.engine.state import GameState
 from bomberman_rl.engine.env import BombermanEnv
+from collections import deque
 from bomberman_rl.engine.physics import BombermanPhysics
-from bomberman_rl.rl.observation import ObservationBuilder, flip_action_to_world, SPATIAL_CHANNELS, DEFAULT_SCALAR_DIM
+from bomberman_rl.rl.observation import (
+    ObservationBuilder,
+    compute_danger_map,
+    flip_action_to_world,
+    SPATIAL_CHANNELS,
+    DEFAULT_SCALAR_DIM,
+)
 from bomberman_rl.rl.rewards import RewardTracker
-from bomberman_rl.rl.action_filter import SafetyActionFilter
+from bomberman_rl.rl.action_filter import SafetyActionFilter, is_bomb_placement_safe
 from bomberman_rl.training.diagnostics import MatchStats
 
 
@@ -45,7 +53,7 @@ DEBUFF_TYPES: set[PowerUpType] = {
 
 
 class HeuristicOpponent:
-    """Lightweight heuristic explorer baseline for league sparring."""
+    """Lightweight heuristic explorer baseline for league sparring with safe escape pathfinding."""
 
     def __init__(self, seed: int | None = None) -> None:
         self.rng = np.random.RandomState(seed)
@@ -62,7 +70,13 @@ class HeuristicOpponent:
             safe_moves = [int(MoveAction.NOOP)]
 
         pr, pc = player.tile
-        can_bomb = bool(masks["bomb_mask"][int(BombAction.PLACE_BOMB)])
+        danger_map = compute_danger_map(state)
+
+        # Check bomb placement safety before placing
+        can_bomb = (
+            bool(masks["bomb_mask"][int(BombAction.PLACE_BOMB)])
+            and is_bomb_placement_safe(state, player_id)
+        )
         adjacent_brick = False
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             nr, nc = pr + dr, pc + dc
@@ -71,8 +85,84 @@ class HeuristicOpponent:
                     adjacent_brick = True
                     break
 
-        bomb_act = int(BombAction.PLACE_BOMB) if (can_bomb and adjacent_brick and self.rng.random() < 0.4) else int(BombAction.NOOP)
-        move_act = int(self.rng.choice(safe_moves))
+        bomb_act = (
+            int(BombAction.PLACE_BOMB)
+            if (can_bomb and adjacent_brick and self.rng.random() < 0.4)
+            else int(BombAction.NOOP)
+        )
+
+        # Movement selection: if currently in blast zone, pathfind toward nearest safe tile
+        if 0 <= pr < GRID_SIZE and 0 <= pc < GRID_SIZE and danger_map[pr, pc] > 0.0:
+            # BFS for reachable safe tiles
+            bomb_tiles = {b.tile for b in state.bombs}
+            queue: deque[tuple[int, int, int]] = deque([(pr, pc, 0)])
+            visited: set[tuple[int, int]] = {(pr, pc)}
+            safe_tiles: list[tuple[int, int]] = []
+
+            while queue:
+                r, c, dist = queue.popleft()
+                if (
+                    danger_map[r, c] == 0.0
+                    and state.flame_timer[r, c] == 0
+                    and (r, c) not in bomb_tiles
+                ):
+                    safe_tiles.append((r, c))
+                    # Stop expanding once closest layer of safe tiles is found
+                    if len(safe_tiles) >= 3:
+                        break
+
+                if dist >= 6:
+                    continue
+
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE and (nr, nc) not in visited:
+                        if (
+                            state.grid[nr, nc] == TileType.EMPTY
+                            and state.flame_timer[nr, nc] == 0
+                            and (player.bomb_pass or (nr, nc) not in bomb_tiles)
+                        ):
+                            visited.add((nr, nc))
+                            queue.append((nr, nc, dist + 1))
+
+            if safe_tiles:
+                # Find target safe tile center closest to player
+                target_tile = min(
+                    safe_tiles,
+                    key=lambda st: abs(player.r - (st[0] + 0.5)) + abs(player.c - (st[1] + 0.5)),
+                )
+                tr_center, tc_center = target_tile[0] + 0.5, target_tile[1] + 0.5
+
+                # Pick the safe ego action that minimizes distance to target
+                best_move = safe_moves[0]
+                best_dist = float("inf")
+                step_dist = player.speed * 0.05
+
+                for ego_m in safe_moves:
+                    world_m, _ = flip_action_to_world((ego_m, 0), player_id) if player_id == 1 else (ego_m, 0)
+                    dr, dc = 0.0, 0.0
+                    if world_m == MoveAction.UP:
+                        dr = -step_dist
+                    elif world_m == MoveAction.DOWN:
+                        dr = step_dist
+                    elif world_m == MoveAction.LEFT:
+                        dc = -step_dist
+                    elif world_m == MoveAction.RIGHT:
+                        dc = step_dist
+
+                    cand_r = player.r + dr
+                    cand_c = player.c + dc
+                    cand_dist = abs(cand_r - tr_center) + abs(cand_c - tc_center)
+                    if cand_dist < best_dist:
+                        best_dist = cand_dist
+                        best_move = ego_m
+
+                move_act = int(best_move)
+            else:
+                move_act = int(self.rng.choice(safe_moves))
+        else:
+            move_act = int(self.rng.choice(safe_moves))
+
         return (move_act, bomb_act)
 
 
@@ -85,9 +175,11 @@ class BombermanMatchEnv:
         self_damage_scale: float = 0.25,
         safety_filter_prob: float = 1.0,
         checkpoint_dir: str = "./checkpoints",
+        max_episode_ticks: int = MAX_TICKS,
     ) -> None:
         self.rng = np.random.RandomState(seed)
-        self.env = BombermanEnv(seed=seed)
+        self.max_episode_ticks = max_episode_ticks
+        self.env = BombermanEnv(seed=seed, max_ticks=max_episode_ticks)
         self.obs_builder = ObservationBuilder(scalar_dim=DEFAULT_SCALAR_DIM)
         self.reward_tracker = RewardTracker(self_damage_scale=self_damage_scale)
         self.action_filter = SafetyActionFilter(enabled=True, safety_filter_prob=safety_filter_prob)
@@ -104,11 +196,22 @@ class BombermanMatchEnv:
         # Telemetry tracking for current match
         self._match_stats = MatchStats()
 
-    def set_curriculum(self, self_damage_scale: float, safety_filter_prob: float) -> None:
+    def set_curriculum(
+        self,
+        self_damage_scale: float,
+        safety_filter_prob: float,
+        max_episode_ticks: int | None = None,
+        escape_guidance_prob: float | None = None,
+    ) -> None:
         self.self_damage_scale = float(self_damage_scale)
         self.safety_filter_prob = float(safety_filter_prob)
         self.reward_tracker.self_damage_scale = self.self_damage_scale
-        self.action_filter.safety_filter_prob = self.safety_filter_prob
+        self.action_filter.placement_filter_prob = self.safety_filter_prob
+        if escape_guidance_prob is not None:
+            self.action_filter.escape_guidance_prob = float(escape_guidance_prob)
+        if max_episode_ticks is not None:
+            self.max_episode_ticks = int(max_episode_ticks)
+            self.env.max_ticks = int(max_episode_ticks)
 
     def set_opponent_pool(self, past_checkpoint_paths: list[str] | None) -> None:
         """Update candidate checkpoint pool for subsequent opponent matchmaking."""
@@ -249,6 +352,7 @@ class BombermanMatchEnv:
 
         done = terminated or truncated
         match_stats_record = None
+        final_state = None
 
         if done:
             # Determine winner and suicide
@@ -280,6 +384,7 @@ class BombermanMatchEnv:
                     self._match_stats.p1_suicide = True
 
             match_stats_record = MatchStats(**self._match_stats.__dict__)
+            final_state = self.env.state.clone()
 
             # Auto-reset environment for the next match
             self.env.reset()
@@ -294,10 +399,18 @@ class BombermanMatchEnv:
         info = {
             "opponent_type": self.opponent_type,
             "opponent_checkpoint": self.opponent_checkpoint_path,
+            "is_p1_learning": bool(self.opponent_type == "latest"),
             "match_stats": match_stats_record,
+            "truncated": bool(env_info.get("truncated", False)),
             "p0_reward": p0_reward,
             "p1_reward": p1_reward,
             "tick": self.env.state.tick,
+            "state_before": state_before,
+            "final_state": final_state,
+            "step_rewards_p0": step_tel["player_0"],
+            "step_rewards_p1": step_tel["player_1"],
+            "action_0": action_p0,
+            "action_1": action_p1,
         }
 
         return obs_0, p0_reward, terminated, truncated, info, mask_0, obs_1, mask_1
@@ -312,6 +425,7 @@ class SyncVectorEnv:
         seed: int | None = 42,
         self_damage_scale: float = 0.25,
         safety_filter_prob: float = 1.0,
+        max_episode_ticks: int = MAX_TICKS,
     ) -> None:
         self.num_envs = num_envs
         self.envs = [
@@ -319,13 +433,20 @@ class SyncVectorEnv:
                 seed=None if seed is None else seed + i,
                 self_damage_scale=self_damage_scale,
                 safety_filter_prob=safety_filter_prob,
+                max_episode_ticks=max_episode_ticks,
             )
             for i in range(num_envs)
         ]
 
-    def set_curriculum(self, self_damage_scale: float, safety_filter_prob: float) -> None:
+    def set_curriculum(
+        self,
+        self_damage_scale: float,
+        safety_filter_prob: float,
+        max_episode_ticks: int | None = None,
+        escape_guidance_prob: float | None = None,
+    ) -> None:
         for env in self.envs:
-            env.set_curriculum(self_damage_scale, safety_filter_prob)
+            env.set_curriculum(self_damage_scale, safety_filter_prob, max_episode_ticks, escape_guidance_prob)
 
     def set_opponent_pool(self, past_checkpoint_paths: list[str] | None) -> None:
         for env in self.envs:
@@ -459,11 +580,13 @@ def _worker_fn(
     seed: int | None,
     self_damage_scale: float,
     safety_filter_prob: float,
+    max_episode_ticks: int = MAX_TICKS,
 ) -> None:
     env = BombermanMatchEnv(
         seed=seed,
         self_damage_scale=self_damage_scale,
         safety_filter_prob=safety_filter_prob,
+        max_episode_ticks=max_episode_ticks,
     )
     while True:
         try:
@@ -480,8 +603,15 @@ def _worker_fn(
             result = env.step(act_0, act_1)
             pipe.send(result)
         elif cmd == "set_curriculum":
-            scale, prob = data
-            env.set_curriculum(scale, prob)
+            if len(data) == 4:
+                scale, prob, max_ticks, esc_prob = data
+                env.set_curriculum(scale, prob, max_ticks, esc_prob)
+            elif len(data) == 3:
+                scale, prob, max_ticks = data
+                env.set_curriculum(scale, prob, max_ticks)
+            else:
+                scale, prob = data
+                env.set_curriculum(scale, prob)
             pipe.send(True)
         elif cmd == "set_opponent_pool":
             env.set_opponent_pool(data)
@@ -500,6 +630,7 @@ class AsyncVectorEnv:
         seed: int | None = 42,
         self_damage_scale: float = 0.25,
         safety_filter_prob: float = 1.0,
+        max_episode_ticks: int = MAX_TICKS,
     ) -> None:
         self.num_envs = num_envs
         self.closed = False
@@ -513,7 +644,7 @@ class AsyncVectorEnv:
             w_seed = None if seed is None else seed + i
             proc = ctx.Process(
                 target=_worker_fn,
-                args=(child_pipe, w_seed, self_damage_scale, safety_filter_prob),
+                args=(child_pipe, w_seed, self_damage_scale, safety_filter_prob, max_episode_ticks),
                 daemon=True,
             )
             proc.start()
@@ -521,9 +652,16 @@ class AsyncVectorEnv:
             self.pipes.append(parent_pipe)
             self.workers.append(proc)
 
-    def set_curriculum(self, self_damage_scale: float, safety_filter_prob: float) -> None:
+    def set_curriculum(
+        self,
+        self_damage_scale: float,
+        safety_filter_prob: float,
+        max_episode_ticks: int | None = None,
+        escape_guidance_prob: float | None = None,
+    ) -> None:
+        msg = ("set_curriculum", (self_damage_scale, safety_filter_prob, max_episode_ticks, escape_guidance_prob))
         for pipe in self.pipes:
-            pipe.send(("set_curriculum", (self_damage_scale, safety_filter_prob)))
+            pipe.send(msg)
         for pipe in self.pipes:
             pipe.recv()
 

@@ -104,6 +104,12 @@ class Renderer:
             self.screen = pygame.display.set_mode((self.WINDOW_WIDTH, self.WINDOW_HEIGHT))
             pygame.display.set_caption(title)
 
+        if not self.headless:
+            try:
+                pygame.mouse.set_visible(False)
+            except Exception:
+                pass
+
         self.clock = pygame.time.Clock()
 
         # Cached procedural textures
@@ -113,15 +119,18 @@ class Renderer:
         self._tex_floor = self._create_floor_texture()
 
         # Fonts
-        self.font_lg = pygame.font.Font(None, 24)
-        self.font_md = pygame.font.Font(None, 18)
-        self.font_sm = pygame.font.Font(None, 14)
-        self.font_xs = pygame.font.Font(None, 12)
+        self.font_lg = pygame.font.Font(None, 26)
+        self.font_md = pygame.font.Font(None, 22)
+        self.font_sm = pygame.font.Font(None, 18)
+        self.font_xs = pygame.font.Font(None, 15)
 
         # Overlays
         self.overlay_danger = False       # Hotkey 1
         self.overlay_safe_space = False   # Hotkey 2
         self.overlay_policy_arrow = False # Hotkey 3
+
+        # Right-hand neural telemetry panel (Hotkey T), hidden by default
+        self.show_telemetry = False
 
         # Particle system
         self.particles: list[BrickParticle] = []
@@ -130,6 +139,7 @@ class Renderer:
         # Sparkline telemetry history (rolling 200 ticks)
         self.v_history_p0: deque[float] = deque(maxlen=200)
         self.v_history_p1: deque[float] = deque(maxlen=200)
+        self._last_sparkline_tick: int = -1
 
         # Scrubber & Playback state
         self.paused = False
@@ -138,6 +148,7 @@ class Renderer:
         self.current_tick = 0
         self.max_ticks = MAX_TICKS
         self.is_dragging_scrubber = False
+        self._mouse_moved = False
 
         # Tooltip for event timeline
         self.active_tooltip: str | None = None
@@ -431,10 +442,6 @@ class Renderer:
         pygame.draw.rect(surface, (20, 30, 40), (cx - 4, cy - 4, 3, 4))
         pygame.draw.rect(surface, (20, 30, 40), (cx + 1, cy - 4, 3, 4))
 
-        # Badge: P0 or P1
-        lbl = self.font_xs.render(f"P{player.id}", True, (255, 255, 255))
-        surface.blit(lbl, lbl.get_rect(center=(cx, cy + 8)))
-
         # Shield forcefield bubble
         if player.shield_timer > 0:
             shield_radius = 26
@@ -527,6 +534,24 @@ class Renderer:
         pygame.draw.rect(surface, COLOR_PANEL_BG, panel_rect)
         pygame.draw.line(surface, COLOR_BORDER, (rx, 0), (rx, self.ARENA_SIZE), 2)
 
+        # Critic value history (rolling 200 ticks) is tracked even while the panel is hidden
+        v0 = telemetry.get("value_p0", 0.0) if telemetry else 0.0
+        v1 = telemetry.get("value_p1", 0.0) if telemetry else 0.0
+
+        if telemetry and "value_history_p0" in telemetry and "value_history_p1" in telemetry:
+            self.v_history_p0 = deque(telemetry["value_history_p0"], maxlen=200)
+            self.v_history_p1 = deque(telemetry["value_history_p1"], maxlen=200)
+            self._last_sparkline_tick = state.tick
+        elif state.tick != self._last_sparkline_tick:
+            self.v_history_p0.append(v0)
+            self.v_history_p1.append(v1)
+            self._last_sparkline_tick = state.tick
+
+        if not self.show_telemetry:
+            hint = self.font_md.render("Press T to show neural telemetry", True, COLOR_TEXT_MUTED)
+            surface.blit(hint, hint.get_rect(center=(rx + (self.WINDOW_WIDTH - rx) // 2, self.ARENA_SIZE // 2)))
+            return
+
         # 1. Header & Overlays status
         header_text = self.font_lg.render("NEURAL TELEMETRY & DIAGNOSTICS", True, COLOR_TEXT_PRIMARY)
         surface.blit(header_text, (rx + 20, 14))
@@ -539,12 +564,7 @@ class Renderer:
         pill_lbl = self.font_xs.render(pill_text, True, COLOR_TEXT_MUTED)
         surface.blit(pill_lbl, (rx + 20, 40))
 
-        # 2. Critic Value V(s) Sparkline Graph (Rolling 200 ticks)
-        v0 = telemetry.get("value_p0", 0.0) if telemetry else 0.0
-        v1 = telemetry.get("value_p1", 0.0) if telemetry else 0.0
-        self.v_history_p0.append(v0)
-        self.v_history_p1.append(v1)
-
+        # 2. Critic Value V(s) Sparkline Graph
         self._render_sparkline(surface, rx + 20, 60, 580, 115, v0, v1)
 
         # 3. Player 0 Diagnostics (Cyan)
@@ -719,10 +739,55 @@ class Renderer:
         r_y = bomb_y + 36
         r_line1 = f"Reward: {tot:+.3f} (Step: {step_tot:+.3f}) | Terminal: {w_l:+.2f}"
         r_line2 = f"Bricks: {brk:+.3f} | PBRS: {pbr:+.3f} | Conn: {con:+.3f}"
-        lbl_r1 = self.font_xs.render(r_line1, True, COLOR_TEXT_PRIMARY)
-        lbl_r2 = self.font_xs.render(r_line2, True, COLOR_TEXT_MUTED)
+        lbl_r1 = self.font_sm.render(r_line1, True, COLOR_TEXT_PRIMARY)
+        lbl_r2 = self.font_sm.render(r_line2, True, COLOR_TEXT_MUTED)
         surface.blit(lbl_r1, (x, r_y))
-        surface.blit(lbl_r2, (x, r_y + 14))
+        surface.blit(lbl_r2, (x, r_y + 18))
+
+    # --- Event Markers ---
+    _EVENT_SHAPES: dict[str, str] = {
+        "brick_destroyed": "diamond",
+        "powerup_pickup": "circle",
+        "shield_activated": "square",
+        "player_death": "cross",
+    }
+
+    def event_marker_shape(self, event_type: str) -> str:
+        """Marker shape encodes the event type."""
+        return self._EVENT_SHAPES.get(event_type, "triangle")
+
+    def event_marker_color(self, ev: GameEvent) -> tuple[int, int, int]:
+        """Marker color encodes the acting player (cyan = P0, red = P1, gold = unattributed)."""
+        if ev.player_id == 0:
+            return COLOR_P0_CYAN
+        if ev.player_id == 1:
+            return COLOR_P1_RED
+        return COLOR_GOLD
+
+    def _draw_event_marker(
+        self, surface: pygame.Surface, mx: int, my: int, shape: str, color: tuple[int, int, int]
+    ) -> None:
+        outline = (10, 12, 16)
+        if shape == "diamond":
+            pts = [(mx, my - 7), (mx + 5, my), (mx, my + 7), (mx - 5, my)]
+            pygame.draw.polygon(surface, color, pts)
+            pygame.draw.polygon(surface, outline, pts, 1)
+        elif shape == "circle":
+            pygame.draw.circle(surface, color, (mx, my), 5)
+            pygame.draw.circle(surface, outline, (mx, my), 5, 1)
+        elif shape == "square":
+            rect = pygame.Rect(mx - 4, my - 4, 8, 8)
+            pygame.draw.rect(surface, color, rect)
+            pygame.draw.rect(surface, outline, rect, 1)
+        elif shape == "cross":
+            pygame.draw.line(surface, outline, (mx - 5, my - 5), (mx + 5, my + 5), 5)
+            pygame.draw.line(surface, outline, (mx - 5, my + 5), (mx + 5, my - 5), 5)
+            pygame.draw.line(surface, color, (mx - 5, my - 5), (mx + 5, my + 5), 3)
+            pygame.draw.line(surface, color, (mx - 5, my + 5), (mx + 5, my - 5), 3)
+        else:
+            pts = [(mx, my - 6), (mx + 5, my + 5), (mx - 5, my + 5)]
+            pygame.draw.polygon(surface, color, pts)
+            pygame.draw.polygon(surface, outline, pts, 1)
 
     # --- Bottom Panel: Timeline Scrubber ---
     def render_bottom_panel(
@@ -731,6 +796,8 @@ class Renderer:
         tick: int,
         total_ticks: int,
         events: list[GameEvent] | None = None,
+        tick_limit: int | None = None,
+        end_reason: str | None = None,
     ) -> None:
         panel_y = self.ARENA_SIZE  # 660
         panel_rect = pygame.Rect(0, panel_y, self.WINDOW_WIDTH, self.WINDOW_HEIGHT - panel_y)
@@ -744,8 +811,10 @@ class Renderer:
         ms = int((time_sec * 100) % 100)
         time_str = f"{m:02d}:{s:02d}.{ms:02d} / 03:00.00"
 
-        tot_display = max(total_ticks, MAX_TICKS)
+        tot_display = tick_limit if tick_limit is not None else max(total_ticks, MAX_TICKS)
         tick_str = f"Tick {tick:04d} / {tot_display:04d}"
+        if end_reason is not None and tick >= total_ticks - 1:
+            tick_str += f" [END: {end_reason}]"
 
         time_lbl = self.font_md.render(time_str, True, COLOR_TEXT_PRIMARY)
         tick_lbl = self.font_md.render(tick_str, True, COLOR_TEXT_MUTED)
@@ -762,9 +831,9 @@ class Renderer:
         speed_lbl = self.font_md.render(speed_str, True, COLOR_TEXT_PRIMARY)
         surface.blit(speed_lbl, (520, panel_y + 12))
 
-        help_str = "Controls: SPACE: Play/Pause | LEFT/RIGHT: Step -1/+1 | UP/DOWN: Speed | 1-3: Overlays"
+        help_str = "Controls: SPACE: Pause | LEFT/RIGHT: Jump ±5s (Step ±1 when paused) | UP/DOWN: Speed | T: Telemetry | 1-3: Overlays"
         help_lbl = self.font_xs.render(help_str, True, COLOR_TEXT_MUTED)
-        surface.blit(help_lbl, (680, panel_y + 14))
+        surface.blit(help_lbl, (660, panel_y + 14))
 
         # 2. Scrubber Track & Synchronization Invariant
         track_x = 40
@@ -794,17 +863,8 @@ class Renderer:
                     mx = track_x + int(ev_ratio * track_w)
                     my = track_y + track_h // 2
 
-                    m_col = COLOR_GOLD
-                    if ev.event_type == "player_death":
-                        m_col = (240, 50, 50)
-                    elif ev.event_type == "shield_activated":
-                        m_col = (80, 220, 255)
-                    elif ev.event_type == "brick_destroyed":
-                        m_col = (200, 100, 50)
-
-                    # Draw diamond marker
-                    pts = [(mx, my - 6), (mx + 4, my), (mx, my + 6), (mx - 4, my)]
-                    pygame.draw.polygon(surface, m_col, pts)
+                    m_col = self.event_marker_color(ev)
+                    self._draw_event_marker(surface, mx, my, self.event_marker_shape(ev.event_type), m_col)
 
                     # Hover detection for tooltip
                     if abs(mouse_pos[0] - mx) < 6 and abs(mouse_pos[1] - my) < 12:
@@ -860,6 +920,9 @@ class Renderer:
         events_processed["human_action"] = (move_act, bomb_act)
 
         for event in pygame.event.get():
+            if event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+                self._mouse_moved = True
+
             if event.type == pygame.QUIT:
                 events_processed["quit"] = True
 
@@ -869,10 +932,10 @@ class Renderer:
                 elif event.key == pygame.K_SPACE:
                     self.paused = not self.paused
                     events_processed["toggle_pause"] = True
-                elif event.key == pygame.K_LEFT and self.paused:
-                    events_processed["step"] = -1
-                elif event.key == pygame.K_RIGHT and self.paused:
-                    events_processed["step"] = 1
+                elif event.key == pygame.K_LEFT:
+                    events_processed["step"] = -1 if self.paused else -5 * TICK_RATE
+                elif event.key == pygame.K_RIGHT:
+                    events_processed["step"] = 1 if self.paused else 5 * TICK_RATE
                 elif event.key == pygame.K_UP:
                     self.speed_idx = min(len(self.speed_multipliers) - 1, self.speed_idx + 1)
                     events_processed["speed_change"] = 1
@@ -886,6 +949,8 @@ class Renderer:
                     self.overlay_safe_space = not self.overlay_safe_space
                 elif event.key == pygame.K_3:
                     self.overlay_policy_arrow = not self.overlay_policy_arrow
+                elif event.key == pygame.K_t:
+                    self.show_telemetry = not self.show_telemetry
                 elif event.key == pygame.K_4:
                     self.overlay_danger = False
                     self.overlay_safe_space = False
@@ -916,6 +981,8 @@ class Renderer:
         events: list[GameEvent] | None = None,
         interp_alpha: float = 1.0,
         total_ticks: int = MAX_TICKS,
+        tick_limit: int | None = None,
+        end_reason: str | None = None,
     ) -> None:
         """Compose and flip the full 1280x760 frame."""
         self.screen.fill(COLOR_BG)
@@ -927,12 +994,44 @@ class Renderer:
         self.render_right_panel(self.screen, state, telemetry)
 
         # Bottom Timeline Scrubber
-        self.render_bottom_panel(self.screen, state.tick, total_ticks, events)
+        self.render_bottom_panel(self.screen, state.tick, total_ticks, events, tick_limit, end_reason)
 
         self.update_particles()
 
+        # In-game custom cursor (resolves WSL invisible hardware cursor)
+        self.render_cursor(self.screen)
+
         if not self.headless:
             pygame.display.flip()
+
+    _CURSOR_OFFSETS: tuple[tuple[int, int], ...] = (
+        (0, 0),
+        (0, 17),
+        (5, 13),
+        (8, 20),
+        (11, 19),
+        (8, 12),
+        (13, 12),
+    )
+
+    def _draw_cursor(self, surface: pygame.Surface, mx: int, my: int) -> None:
+        """Draw high-contrast hardware-style cursor arrow with dark border and drop shadow."""
+        pts = [(mx + dx, my + dy) for dx, dy in self._CURSOR_OFFSETS]
+        shadow_pts = [(x + 1, y + 2) for x, y in pts]
+        pygame.draw.polygon(surface, (10, 12, 16), shadow_pts)
+        pygame.draw.polygon(surface, (250, 252, 255), pts)
+        pygame.draw.polygon(surface, (15, 18, 24), pts, 1)
+
+    def render_cursor(self, surface: pygame.Surface) -> None:
+        """Render custom software cursor to ensure visibility across all platforms (e.g. WSL)."""
+        if self.headless:
+            return
+        if not self._mouse_moved and not pygame.mouse.get_focused():
+            return
+        mx, my = pygame.mouse.get_pos()
+        if not (0 <= mx < self.WINDOW_WIDTH and 0 <= my < self.WINDOW_HEIGHT):
+            return
+        self._draw_cursor(surface, mx, my)
 
     def tick_clock(self, fps: int = 60) -> float:
         return self.clock.tick(fps) / 1000.0

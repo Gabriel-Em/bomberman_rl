@@ -29,6 +29,35 @@ class MatchStats:
     kicks_executed: int = 0
     chain_detonations: int = 0
 
+    @property
+    def powerups_collected(self) -> int:
+        """Total powerups (buffs and debuffs) collected by all players in the match."""
+        return (
+            self.p0_buffs_collected
+            + self.p0_debuffs_collected
+            + self.p1_buffs_collected
+            + self.p1_debuffs_collected
+        )
+
+
+def compute_interest_score(
+    bricks_destroyed: int | float,
+    powerups_collected: int | float,
+    kicks_executed: int | float,
+    match_duration_ticks: int | float,
+) -> float:
+    """Compute replay interest score.
+
+    Formula:
+        score = (bricks_destroyed * 2.0) + (powerups_collected * 5.0) + (kicks_executed * 10.0) + (match_duration_ticks * 0.01)
+    """
+    return float(
+        (bricks_destroyed * 2.0)
+        + (powerups_collected * 5.0)
+        + (kicks_executed * 10.0)
+        + (match_duration_ticks * 0.01)
+    )
+
 
 class BehaviorDiagnostics:
     """Aggregates and formats emergent behavior metrics across training generations."""

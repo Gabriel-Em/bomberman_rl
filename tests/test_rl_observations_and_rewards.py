@@ -13,6 +13,7 @@ from bomberman_rl.engine.config import (
     PowerUpType,
 )
 from bomberman_rl.engine.state import GameState, PlayerState, BombState
+from bomberman_rl.engine.physics import BombermanPhysics
 from bomberman_rl.rl.observation import (
     SPATIAL_CHANNELS,
     DEFAULT_SCALAR_DIM,
@@ -27,11 +28,13 @@ from bomberman_rl.rl.rewards import (
     CurriculumLethalityScheduler,
     RewardTracker,
     compute_pbrs_potential,
+    compute_danger_potential,
     check_players_connected,
     BRICK_REWARD,
     CONNECTIVITY_REWARD,
     AUXILIARY_REWARD_CAP,
     TERMINAL_WIN,
+    SURVIVAL_BONUS,
     TERMINAL_DRAW,
 )
 from bomberman_rl.rl.action_filter import SafetyActionFilter
@@ -446,7 +449,7 @@ def test_terminal_win_loss_draw_and_self_damage_annealing() -> None:
     _, tel_early = tracker_early.step(state_before, [(0, 0), (0, 0)], state_suicide, terminated=True, truncated=False)
 
     assert tel_early["player_0"]["loss"] == -0.25
-    assert tel_early["player_1"]["win"] == TERMINAL_WIN
+    assert tel_early["player_1"]["win"] == SURVIVAL_BONUS
 
     # 3. Same suicide in late curriculum (scale=1.0)
     tracker_late = RewardTracker(self_damage_scale=1.0)
@@ -975,4 +978,486 @@ def test_auxiliary_cap_exact_component_sum() -> None:
     component_sum = log_0.brick_destruction + log_0.pbrs_stats + log_0.connectivity
     assert np.isclose(component_sum, log_0.total, atol=1e-6)
     assert log_0.total <= 0.35
+
+
+def test_zero_time_decay_danger_pbrs_and_continuous_escape() -> None:
+    """Verify stationary agent in bomb danger experiences zero time-decay drain and positive escape steps."""
+    state = create_clean_game_state()
+    tracker = RewardTracker()
+    tracker.reset(state)
+
+    # Tick 0: Bomb placed at (0, 1)
+    state_after = state.clone()
+    state_after.bombs.append(BombState(id=0, owner_id=0, r=0.5, c=1.5, timer=60, blast_radius=1))
+    _, tel0 = tracker.step(state, [(MoveAction.NOOP, BombAction.PLACE_BOMB), (MoveAction.NOOP, BombAction.NOOP)], state_after, False, False)
+    assert tel0["player_0"]["pbrs_danger"] >= 0.0
+
+    # 10 stationary ticks: countdown from 59 to 50
+    curr_state = state_after
+    for tick in range(10):
+        next_state = curr_state.clone()
+        next_state.bombs[0].timer = 59 - tick
+        _, tel = tracker.step(curr_state, [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], next_state, False, False)
+        # Verify pbrs_danger is strictly 0.0000 on every stationary tick (zero negative time drain)
+        assert np.isclose(tel["player_0"]["pbrs_danger"], 0.0, atol=1e-6), (
+            f"Tick {tick}: expected strictly 0.0000 stationary pbrs_danger, got {tel['player_0']['pbrs_danger']}"
+        )
+        curr_state = next_state
+
+    # Now Player 0 takes 0.125 sub-tile steps DOWN toward safe tile (1, 0)
+    for step in range(4):
+        step_state = curr_state.clone()
+        step_state.players[0].r = curr_state.players[0].r + 0.125
+        step_state.bombs[0].timer = curr_state.bombs[0].timer - 1
+        _, tel_step = tracker.step(curr_state, [(MoveAction.DOWN, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], step_state, False, False)
+        assert tel_step["player_0"]["pbrs_danger"] > 0.0, (
+            f"Sub-tile step {step}: expected strictly > 0.0 pbrs_danger, got {tel_step['player_0']['pbrs_danger']}"
+        )
+        curr_state = step_state
+
+
+def test_opponent_suicide_payoff_isolation() -> None:
+    """Verify opponent suicide awards surviving player at most +0.05, not +1.0."""
+    state_before = create_clean_game_state()
+    tracker = RewardTracker(self_damage_scale=0.25)
+    tracker.reset(state_before)
+
+    # Player 1 places bomb at (8, 7) and blows itself up; Player 0 stays at (0.5, 0.5)
+    state_dead = state_before.clone()
+    state_dead.players[1].alive = False
+    p1_tile = state_dead.players[1].tile
+    # Fatal flame owned exclusively by Player 1 (suicide)
+    state_dead.flame_owner_mask[p1_tile[0], p1_tile[1]] = 1 << 1
+
+    _, tel = tracker.step(state_before, [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state_dead, terminated=True, truncated=False)
+
+    # Player 0 must receive at most +0.05 (survival bonus), NOT +1.0
+    assert tel["player_0"]["win"] <= 0.05, f"Expected <= 0.05 survival bonus on opponent suicide, got {tel['player_0']['win']}"
+    assert tel["player_1"]["loss"] == -0.25  # scale 0.25 * -1.0
+
+    # Conversely, if Player 0's own bomb killed Player 1, Player 0 gets +1.0
+    state_true_kill = state_before.clone()
+    state_true_kill.players[1].alive = False
+    state_true_kill.flame_owner_mask[p1_tile[0], p1_tile[1]] = 1 << 0  # Killed by P0
+    tracker.reset(state_before)
+    _, tel_kill = tracker.step(state_before, [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state_true_kill, terminated=True, truncated=False)
+    assert tel_kill["player_0"]["win"] == 1.0
+    assert tel_kill["player_1"]["loss"] == -1.0
+
+
+def test_seeded_spawn_and_monotonic_frontier_progression() -> None:
+    """Verify spawn tiles are pre-seeded and continuous frontier reward only awards on new furthest distance."""
+    state_init = create_clean_game_state()
+    tracker = RewardTracker()
+    tracker.reset(state_init)
+
+    # Spawn tile (0, 0) must already be marked visited
+    assert tracker.visited_tiles[0, 0, 0] == True
+    assert tracker.visited_tiles[1, 8, 8] == True
+
+    # Move Player 0 from (0.5, 0.5) to (1.1, 0.5)
+    state_step1 = state_init.clone()
+    state_step1.players[0].r = 1.1
+    state_step1.players[0].c = 0.5
+    _, tel1 = tracker.step(state_init, [(MoveAction.DOWN, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state_step1, False, False)
+    frontier_rew1 = tel1["player_0"].get("frontier", 0.0)
+    assert frontier_rew1 > 0.0, f"Expected positive frontier reward moving away from spawn, got {frontier_rew1}"
+
+    # Move back from (1.1, 0.5) to (0.5, 0.5)
+    state_back = state_step1.clone()
+    state_back.players[0].r = 0.5
+    state_back.players[0].c = 0.5
+    _, tel_back = tracker.step(state_step1, [(MoveAction.UP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state_back, False, False)
+    # Returning to (0, 0) must award 0.0 visitation reward and 0.0 frontier reward
+    assert tel_back["player_0"].get("visitation", 0.0) == 0.0, "Returning to spawn tile must award 0.0 visitation"
+    assert tel_back["player_0"].get("frontier", 0.0) == 0.0, "Retreating toward spawn must award 0.0 frontier reward"
+
+
+def test_danger_pbrs_boundary_reset_only_for_new_bomb_threat() -> None:
+    """Verify walking into an old blast zone is penalized even if opponent places a new bomb elsewhere."""
+    tracker = RewardTracker()
+    state_before = create_clean_game_state()
+    # Bomb 0 already exists at (0, 1), threatening (0, 0)
+    state_before.bombs.append(BombState(id=0, owner_id=0, r=0.5, c=1.5, timer=50, blast_radius=1))
+    # Player 0 is on safe tile (1, 0)
+    state_before.players[0].r = 1.5
+    state_before.players[0].c = 0.5
+    tracker.reset(state_before)
+
+    # Next tick: Player 0 moves UP into threatened tile (0, 0). Player 1 places Bomb 1 at (8, 8).
+    state_after = state_before.clone()
+    state_after.players[0].r = 0.5
+    state_after.players[0].c = 0.5
+    state_after.bombs.append(BombState(id=1, owner_id=1, r=8.5, c=8.5, timer=59, blast_radius=1))
+
+    _, tel = tracker.step(
+        state_before,
+        [(MoveAction.UP, BombAction.NOOP), (MoveAction.NOOP, BombAction.PLACE_BOMB)],
+        state_after,
+        False,
+        False,
+    )
+    assert tel["player_0"]["pbrs_danger"] < 0.0, (
+        f"Expected negative pbrs_danger walking into old bomb, got {tel['player_0']['pbrs_danger']}"
+    )
+
+
+def test_brick_reward_not_choked_by_tile_visitation() -> None:
+    """Verify auxiliary reward cap does not starve brick destruction rewards after extensive exploration."""
+    tracker = RewardTracker()
+    state = create_clean_game_state()
+    tracker.reset(state)
+
+    # Player 0 visits 50 novel tiles
+    for step in range(50):
+        st_next = state.clone()
+        st_next.players[0].r = (step % 9) + 0.5
+        st_next.players[0].c = (step // 9) + 0.5
+        tracker.step(
+            state,
+            [(MoveAction.RIGHT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)],
+            st_next,
+            False,
+            False,
+        )
+        state = st_next
+
+    # Player 0 destroys a brick
+    st_brick = state.clone()
+    st_brick.grid[1, 2] = TileType.EMPTY
+    state.grid[1, 2] = TileType.BRICK
+    st_brick.flame_owner_mask[1, 2] = 1 << 0
+
+    _, tel = tracker.step(
+        state,
+        [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)],
+        st_brick,
+        False,
+        False,
+    )
+    assert np.isclose(tel["player_0"]["brick_destruction"], BRICK_REWARD), (
+        f"Expected brick destruction reward {BRICK_REWARD}, got {tel['player_0']['brick_destruction']}"
+    )
+
+
+def test_custom_spawn_coords_frontier_potential() -> None:
+    """Verify non-standard spawn locations do not award artificial frontier jump on first step."""
+    tracker = RewardTracker()
+    state = create_clean_game_state()
+    state.players[0].r = 2.5
+    state.players[0].c = 2.5
+    tracker.reset(state)
+
+    st_next = state.clone()
+    _, tel = tracker.step(
+        state,
+        [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)],
+        st_next,
+        False,
+        False,
+    )
+    assert tel["player_0"]["frontier"] == 0.0, (
+        f"Expected 0.0 frontier reward on stationary custom spawn, got {tel['player_0']['frontier']}"
+    )
+
+
+def test_corner_rounding_geodesic_waveguide() -> None:
+    """Verify corner-rounding geodesic waveguide rewards:
+    - Bomb at (1, 0)
+    - Player 0 at (1.65, 0.65)
+    - Moving RIGHT toward c=0.75 (into pillar corner) yields strictly negative pbrs_danger
+    - Moving LEFT toward c=0.50 (corridor center) yields strictly positive pbrs_danger
+    - Moving UP toward (0.5, 0.5) yields strictly positive pbrs_danger on every 0.125 sub-tile step
+    - Smoothly transitions to pulling RIGHT toward (0.5, 1.5) once player.r < 1.0.
+    """
+    state = GameState.create_initial(seed=42)
+    state.bombs = [BombState(id=0, owner_id=0, r=1.5, c=0.5, timer=50, blast_radius=2, overlapping_players={0})]
+    state.players[0].r = 1.65
+    state.players[0].c = 0.65
+
+    tracker = RewardTracker()
+    tracker.reset(state)
+
+    # 1. Moving RIGHT toward c=0.75 into pillar corner -> strictly negative pbrs_danger
+    st_right = state.clone()
+    st_right.players[0].c = 0.75
+    _, tel_right = tracker.step(
+        state,
+        [(MoveAction.RIGHT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)],
+        st_right,
+        False,
+        False,
+    )
+    assert tel_right["player_0"]["pbrs_danger"] < 0.0, (
+        f"Moving RIGHT into pillar corner must yield strictly negative pbrs_danger, got {tel_right['player_0']['pbrs_danger']}"
+    )
+
+    # 2. Moving LEFT toward c=0.50 corridor center -> strictly positive pbrs_danger
+    tracker.reset(state)
+    st_left = state.clone()
+    st_left.players[0].c = 0.50
+    _, tel_left = tracker.step(
+        state,
+        [(MoveAction.LEFT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)],
+        st_left,
+        False,
+        False,
+    )
+    assert tel_left["player_0"]["pbrs_danger"] > 0.0, (
+        f"Centering LEFT must yield strictly positive pbrs_danger, got {tel_left['player_0']['pbrs_danger']}"
+    )
+
+    # 3. Moving UP toward (0.5, 0.5) on every 0.125 sub-tile step -> strictly positive pbrs_danger
+    curr_state = st_left
+    steps = int(round((1.65 - 1.0) / 0.125))
+    for s in range(steps):
+        next_state = curr_state.clone()
+        next_state.players[0].r = curr_state.players[0].r - 0.125
+        _, tel_up = tracker.step(
+            curr_state,
+            [(MoveAction.UP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)],
+            next_state,
+            False,
+            False,
+        )
+        assert tel_up["player_0"]["pbrs_danger"] > 0.0, (
+            f"Step {s}: moving UP must yield strictly positive pbrs_danger, got {tel_up['player_0']['pbrs_danger']}"
+        )
+        curr_state = next_state
+
+    # 4. Once player.r < 1.0, smoothly transitions to pulling RIGHT toward (0.5, 1.5)
+    st_round_corner = curr_state.clone()
+    st_round_corner.players[0].r = 0.95
+    st_round_corner.players[0].c = 0.50
+    _, _ = tracker.step(
+        curr_state,
+        [(MoveAction.UP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)],
+        st_round_corner,
+        False,
+        False,
+    )
+
+    st_right_corridor = st_round_corner.clone()
+    st_right_corridor.players[0].c = 0.625
+    _, tel_round = tracker.step(
+        st_round_corner,
+        [(MoveAction.RIGHT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)],
+        st_right_corridor,
+        False,
+        False,
+    )
+    assert tel_round["player_0"]["pbrs_danger"] > 0.0, (
+        f"Rounding corner RIGHT must yield strictly positive pbrs_danger, got {tel_round['player_0']['pbrs_danger']}"
+    )
+
+
+def test_threat_escape_action_mask() -> None:
+    """Verify threat escape action masking:
+    With bomb at (1, 0), Player 0 at (1.5, 0.5), and safety_filter_prob = 1.0,
+    get_action_masks sets move_mask[NOOP] = False, move_mask[DOWN] = False,
+    and keeps move_mask[UP] = True (toward waypoint (0, 0)).
+    """
+    state = GameState.create_initial(seed=42)
+    state.bombs = [BombState(id=0, owner_id=0, r=1.5, c=0.5, timer=50, blast_radius=2, overlapping_players={0})]
+    state.players[0].r = 1.5
+    state.players[0].c = 0.5
+
+    saf = SafetyActionFilter(safety_filter_prob=1.0)
+    masks = saf.get_action_masks(state, player_id=0)
+    move_mask = masks["move_mask"]
+
+    assert bool(move_mask[MoveAction.NOOP]) is False, f"Expected NOOP to be False, got {move_mask[MoveAction.NOOP]}"
+    assert bool(move_mask[MoveAction.DOWN]) is False, f"Expected DOWN to be False, got {move_mask[MoveAction.DOWN]}"
+    assert bool(move_mask[MoveAction.UP]) is True, f"Expected UP to be True, got {move_mask[MoveAction.UP]}"
+
+
+def test_action_filter_no_state_mutation_on_kickable_bomb() -> None:
+    """SafetyActionFilter.get_action_mask must be side-effect free and never mutate bomb velocities."""
+    state = GameState.create_initial(seed=42)
+    state.grid[2, 0] = TileType.EMPTY
+    state.players[0].can_kick = True
+    state.players[0].r = 1.6
+    state.players[0].c = 0.5
+    b = BombState(id=0, owner_id=1, r=2.5, c=0.5, timer=50, blast_radius=2)
+    state.bombs = [b]
+
+    saf = SafetyActionFilter(safety_filter_prob=1.0)
+    _ = saf.get_action_mask(state, player_id=0)
+
+    assert b.velocity_r == 0.0, f"Expected b.velocity_r == 0.0, got {b.velocity_r}"
+    assert b.velocity_c == 0.0, f"Expected b.velocity_c == 0.0, got {b.velocity_c}"
+
+
+def test_danger_potential_fallback_ignores_unbreakable_pillars() -> None:
+    """Fallback BFS in compute_danger_potential must not treat interior unbreakable pillars as safe tiles."""
+    p = PlayerState(id=0, r=1.5, c=0.5)
+    dmap = np.ones((GRID_SIZE, GRID_SIZE), dtype=np.float32)
+    # Pillar at (1, 1) has danger == 0.0, but is a solid pillar and cannot be an escape tile
+    dmap[1, 1] = 0.0
+    phi = compute_danger_potential(p, dmap)
+    # With no legitimate safe tiles reachable within 6 steps, d_path must be penalized (e.g. >= 7.0)
+    # so phi must be <= -0.08 * (1.0 + 7.0) = -0.64, NEVER -0.16 (which accepted pillar as safe)
+    assert phi <= -0.08 * (1.0 + 7.0), f"Expected phi <= -0.64 (unreachable), got {phi}"
+
+
+def test_danger_potential_trapped_monotonicity() -> None:
+    """A trapped player with 0 reachable safe tiles must have strictly worse potential than a player 5 steps from safety."""
+    state_trapped = GameState.create_initial(seed=42)
+    # Completely box player in (0, 0) with a bomb at (0, 0)
+    state_trapped.players[0].r = 0.5
+    state_trapped.players[0].c = 0.5
+    state_trapped.grid[0, 1] = TileType.BRICK
+    state_trapped.grid[1, 0] = TileType.BRICK
+    b_trap = BombState(id=0, owner_id=0, r=0.5, c=0.5, timer=50, blast_radius=1)
+    state_trapped.bombs = [b_trap]
+    dmap_trapped = compute_danger_map(state_trapped)
+    phi_trapped = compute_danger_potential(state_trapped, state_trapped.players[0], dmap_trapped)
+
+    # State where safe tile is reachable 5 steps away along open top row
+    state_reach = GameState.create_initial(seed=42)
+    state_reach.players[0].r = 0.5
+    state_reach.players[0].c = 0.5
+    for c in range(1, 6):
+        state_reach.grid[0, c] = TileType.EMPTY
+    # Bomb at (0, 0) with blast radius 4 covers up to (0, 4); nearest safe tile is (0, 5) which is 5 steps away
+    b_reach = BombState(id=0, owner_id=0, r=0.5, c=0.5, timer=50, blast_radius=4)
+    state_reach.bombs = [b_reach]
+    dmap_reach = compute_danger_map(state_reach)
+    phi_reach = compute_danger_potential(state_reach, state_reach.players[0], dmap_reach)
+
+    assert phi_trapped < phi_reach, (
+        f"Trapped player potential ({phi_trapped}) must be strictly more negative than 5-step escape ({phi_reach})"
+    )
+
+
+def test_anti_thrash_and_calm_shelter_waiting() -> None:
+    """Verify anti-thrash penalty (-0.001 per reversal on same tile) and calm shelter bonus (+0.0005 on safe tile with ticking bomb)."""
+    state = GameState.create_initial(seed=42)
+    state.grid.fill(TileType.EMPTY)
+    state.grid[1, 1] = TileType.PILLAR
+    state.players[0].r = 0.5
+    state.players[0].c = 1.5
+    tracker = RewardTracker()
+    tracker.reset(state)
+
+    # 1. First move: LEFT within tile (0, 1)
+    s_before = state.clone()
+    BombermanPhysics.step(state, [(MoveAction.LEFT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)])
+    rews1, tel1 = tracker.step(s_before, [(MoveAction.LEFT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+    assert tel1["player_0"].get("anti_thrash", 0.0) == 0.0
+
+    # 2. Reversal 1: RIGHT within same tile (0, 1) -> incurs -0.001
+    s_before = state.clone()
+    BombermanPhysics.step(state, [(MoveAction.RIGHT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)])
+    rews2, tel2 = tracker.step(s_before, [(MoveAction.RIGHT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+    assert np.isclose(tel2["player_0"].get("anti_thrash", 0.0), -0.001)
+
+    # 3. Reversal 2: LEFT within same tile (0, 1) -> incurs -0.001
+    s_before = state.clone()
+    BombermanPhysics.step(state, [(MoveAction.LEFT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)])
+    rews3, tel3 = tracker.step(s_before, [(MoveAction.LEFT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+    assert np.isclose(tel3["player_0"].get("anti_thrash", 0.0), -0.001)
+
+    # 4. Calm shelter waiting bonus: active ticking bomb on board, player on safe tile choosing NOOP
+    bomb = BombState(id=0, owner_id=1, r=4.5, c=4.5, timer=50, blast_radius=2)
+    state.bombs = [bomb]
+    state.players[0].r = 0.5
+    state.players[0].c = 1.5
+    # (0, 1) is safe from bomb at (4, 4)
+    s_before = state.clone()
+    BombermanPhysics.step(state, [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)])
+    rews_shelter, tel_shelter = tracker.step(s_before, [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+    assert np.isclose(tel_shelter["player_0"].get("calm_shelter", 0.0), 0.0005)
+
+
+def test_anti_thrash_exemptions_and_shelter_boundaries() -> None:
+    """Adversarial coverage for anti-thrash exemptions and calm shelter boundaries:
+    1. Cross-tile reversal does not incur thrash penalty.
+    2. Post-bomb placement tick is exempt from thrash penalty (escape reversal allowed).
+    3. NOOP on threatened tile (danger > 0) does not award shelter bonus.
+    4. NOOP when no bombs exist does not award shelter bonus.
+    5. Dead player receives 0.0 thrash penalty and 0.0 shelter bonus.
+    """
+    state = GameState.create_initial(seed=42)
+    state.grid.fill(TileType.EMPTY)
+    tracker = RewardTracker()
+    tracker.reset(state)
+
+    # 1. Cross-tile reversal: player moves from (0, 1) into (0, 2), then reverses to (0, 1)
+    state.players[0].r = 0.5
+    state.players[0].c = 1.95  # Tile (0, 1)
+    s_before = state.clone()
+    # Move RIGHT into tile (0, 2)
+    state.players[0].c = 2.075
+    rews, tel = tracker.step(s_before, [(MoveAction.RIGHT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+
+    # Next tick: Reverse LEFT from (0, 2) back toward (0, 1) (different tile transition!)
+    s_before = state.clone()
+    state.players[0].c = 1.95
+    rews, tel = tracker.step(s_before, [(MoveAction.LEFT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+    assert tel["player_0"].get("anti_thrash", 0.0) == 0.0, "Cross-tile reversal must be exempt from anti-thrash penalty"
+
+    # 2. Bomb placement exemption: place bomb on tick t, reverse direction on tick t+1
+    state.players[0].r = 0.5
+    state.players[0].c = 0.5
+    tracker.reset(state)
+
+    # Tick t: move RIGHT and PLACE_BOMB
+    s_before = state.clone()
+    state.bombs.append(BombState(id=10, owner_id=0, r=0.5, c=0.5, timer=50, blast_radius=1))
+    rews, tel = tracker.step(s_before, [(MoveAction.RIGHT, BombAction.PLACE_BOMB), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+
+    # Tick t+1: reverse LEFT on the same tile
+    s_before = state.clone()
+    rews, tel = tracker.step(s_before, [(MoveAction.LEFT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+    assert tel["player_0"].get("anti_thrash", 0.0) == 0.0, "Reversal immediately after placing a bomb must be exempt"
+
+    # 3. NOOP on threatened tile (danger > 0) awards NO shelter bonus
+    tracker.reset(state)
+    state.bombs = [BombState(id=20, owner_id=1, r=0.5, c=0.5, timer=50, blast_radius=2)]
+    state.players[0].r = 0.5
+    state.players[0].c = 0.5  # Player is directly on the bomb!
+    s_before = state.clone()
+    rews, tel = tracker.step(s_before, [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+    assert tel["player_0"].get("calm_shelter", 0.0) == 0.0, "NOOP in blast danger must not receive shelter bonus"
+
+    # 4. NOOP when no bombs exist on board awards NO shelter bonus
+    tracker.reset(state)
+    state.bombs = []
+    state.players[0].r = 0.5
+    state.players[0].c = 0.5
+    s_before = state.clone()
+    rews, tel = tracker.step(s_before, [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+    assert tel["player_0"].get("calm_shelter", 0.0) == 0.0, "NOOP with 0 bombs must not receive shelter bonus"
+
+    # 5. Dead player receives neither thrash penalty nor shelter bonus
+    tracker.reset(state)
+    state.players[0].alive = False
+    state.bombs = [BombState(id=30, owner_id=1, r=4.5, c=4.5, timer=50, blast_radius=1)]
+    s_before = state.clone()
+    rews, tel = tracker.step(s_before, [(MoveAction.NOOP, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)], state, False, False)
+    assert tel["player_0"].get("calm_shelter", 0.0) == 0.0
+    assert tel["player_0"].get("anti_thrash", 0.0) == 0.0
+
+    # 6. Action format versatility: dict with string keys and omitted players
+    state.players[0].alive = True
+    tracker.reset(state)
+    s_before = state.clone()
+    # String keys with NOOP
+    rews, tel_dict = tracker.step(s_before, {"player_0": (MoveAction.NOOP, BombAction.NOOP)}, state, False, False)
+    assert np.isclose(tel_dict["player_0"].get("calm_shelter", 0.0), 0.0005), "Dict with string keys must award shelter bonus"
+    assert np.isclose(tel_dict["player_1"].get("calm_shelter", 0.0), 0.0005), "Omitted player key must default to NOOP (0, 0)"
+
+    # Flat integer actions in dict format
+    tracker.reset(state)
+    s_before = state.clone()
+    rews, tel_flat = tracker.step(s_before, {"player_0": 0, "player_1": 0}, state, False, False)
+    assert np.isclose(tel_flat["player_0"].get("calm_shelter", 0.0), 0.0005)
+
+
+
+
+
+
+
 

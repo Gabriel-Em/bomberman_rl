@@ -60,6 +60,7 @@ bomberman_rl/
     └── renderer.py       # 1280x760 rendering loop, overlays, and scrubber UI
 train.py                  # CLI training entrypoint
 archive.py                # Standalone CLI training archival utility
+replay.py                 # Fast CLI replay runner (plays latest replay by default)
 tests/                    # Test suite covering engine, physics, RL, and replays
 ```
 
@@ -141,7 +142,7 @@ python train.py --sync --num-envs 4
 | `--checkpoint-dir` | `str` | `./checkpoints` | Target directory for saving model weight snapshots (`.pt`). |
 | `--replays-dir` | `str` | `./replays` | Target directory for automated showcase replays (`.npz`). |
 | `--showcase-interval` | `int` | `10` | Frequency (generations) between automated match recordings. |
-| `--resume` | `str` | `None` | Resume training from checkpoint file path or `'latest'`. |
+| `--resume` | `str` | `None` | Resume training from checkpoint file path or `'latest'`. When omitted, unarchived training data from stopped runs is removed to start clean. |
 | `--archive-first` | flag | `False` | Automatically archive previous checkpoints and replays to `./archives` before training. |
 | `--device` | `str` | `cuda`/`cpu` | Compute device (`cpu` or `cuda`). Auto-detects CUDA when available. |
 | `--sync` | flag | `False` | Run synchronous vector env instead of asynchronous multi-process. |
@@ -195,16 +196,28 @@ The visualizer provides a 1280x760 telemetry dashboard with live arena rendering
 
 ### Viewing Replays
 
-To inspect a recorded replay trajectory:
+To instantly play the most recent replay in `./replays/` without specifying arguments:
+
+```bash
+python replay.py
+```
+
+List all recorded replays with timestamps and file sizes:
+
+```bash
+python replay.py --list
+```
+
+Or view a specific replay trajectory:
+
+```bash
+python replay.py ./replays/test_match.npz
+```
+
+You can also use the full module interface with custom options:
 
 ```bash
 python -m bomberman_rl.visualizer.play_interactive --mode replay --replay ./replays/test_match.npz
-```
-
-Or view an automated showcase replay from a training session:
-
-```bash
-python -m bomberman_rl.visualizer.play_interactive --mode replay --replay ./replays/gen_0000_20261108_235553.npz
 ```
 
 ### Live Agent vs Agent

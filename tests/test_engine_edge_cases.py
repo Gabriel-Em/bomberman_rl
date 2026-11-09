@@ -756,19 +756,25 @@ def test_corner_sliding_no_backward_teleport():
 
 
 # ---------------------------------------------------------------------------
-# Test 22: Outer Border Motion Precision (No Phantom Perpendicular Nudge)
+# Test 22: Outer Border Motion Precision (Centerline Rail-Locking & Alignment)
 # ---------------------------------------------------------------------------
 def test_outer_border_sliding_no_phantom_snag():
-    """Verify moving parallel to outer border wall does not trigger phantom snag or nudge."""
+    """Verify moving parallel to outer border maintains centerline rail alignment without phantom snag."""
     state = GameState.create_initial(seed=42)
     state.grid.fill(TileType.EMPTY)
 
     p0 = state.players[0]
-    p0.r, p0.c = 0.35, 0.50
+    p0.r, p0.c = 0.50, 0.50
 
     BombermanPhysics.step(state, [(MoveAction.RIGHT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)])
-    assert abs(p0.r - 0.35) < 1e-5, f"Moving RIGHT along top border should not alter r, got {p0.r}"
-    assert p0.c > 0.50, "Player should advance smoothly along border"
+    assert abs(p0.r - 0.50) < 1e-5, f"Moving RIGHT along corridor centerline should keep r=0.50, got {p0.r}"
+    assert p0.c > 0.50, "Player should advance smoothly along border corridor"
+
+    # Off-center player at 0.35 should smoothly rail-align toward row centerline 0.50
+    p0.r, p0.c = 0.35, 0.50
+    BombermanPhysics.step(state, [(MoveAction.RIGHT, BombAction.NOOP), (MoveAction.NOOP, BombAction.NOOP)])
+    assert p0.r > 0.35 and p0.r <= 0.50, f"Off-axis player should nudge toward row centerline 0.50, got {p0.r}"
+
 
 
 # ---------------------------------------------------------------------------
@@ -878,3 +884,146 @@ def test_chain_reaction_rolling_bomb_crossing_tile():
 
     assert len(state.bombs) == 0, "Rolling bomb spanning tile boundary should chain detonate when hit at tile 4"
 
+
+# ---------------------------------------------------------------------------
+# Test 28: Classic Arcade Centerline Rail-Locking at (0, 1)
+# ---------------------------------------------------------------------------
+def test_centerline_rail_locking_at_0_1():
+    """Verify arcade centerline rail locking at tile (0, 1):
+    At (0, 1) (r=0.5, c=1.5), outer wall is at (-1, 1) and pillar is at (1, 1).
+    Attempting UP or DOWN produces 0.0 displacement (player stays at r=0.5)
+    and both UP and DOWN are masked in move_mask.
+    """
+    state = GameState.create_initial(seed=42)
+    state.grid[0, 1] = TileType.EMPTY
+    state.grid[1, 1] = TileType.PILLAR
+    player = state.players[0]
+    player.r = 0.5
+    player.c = 1.5
+
+    # Test UP displacement
+    p_up = player.clone()
+    BombermanPhysics.move_player(p_up, MoveAction.UP, state)
+    assert p_up.r == 0.5, f"Expected player.r to remain 0.5, got {p_up.r}"
+    assert p_up.c == 1.5
+    assert abs(p_up.r - player.r) == 0.0
+
+    # Test DOWN displacement
+    p_down = player.clone()
+    BombermanPhysics.move_player(p_down, MoveAction.DOWN, state)
+    assert p_down.r == 0.5, f"Expected player.r to remain 0.5, got {p_down.r}"
+    assert p_down.c == 1.5
+    assert abs(p_down.r - player.r) == 0.0
+
+    # Test ActionFilter masking
+    from bomberman_rl.rl.action_filter import SafetyActionFilter
+    saf = SafetyActionFilter(enabled=True)
+    masks = saf.get_action_mask(state, player_id=0, ego_perspective=False)
+    assert masks["move_mask"][int(MoveAction.UP)] == False, "UP should be masked at (0, 1)"
+    assert masks["move_mask"][int(MoveAction.DOWN)] == False, "DOWN should be masked at (0, 1)"
+
+
+# ---------------------------------------------------------------------------
+# Test 29: Centerline Rail-Locking Boundaries, Corners, and Idempotence
+# ---------------------------------------------------------------------------
+def test_centerline_rail_locking_boundaries_and_idempotence():
+    """Verify centerline rail-locking at outer corners (0,0) and (8,8), plus multi-tick idempotence."""
+    state = GameState.create_initial(seed=42)
+    state.grid.fill(TileType.EMPTY)
+    p0 = state.players[0]
+
+    # At corner (0, 0), centerline is (0.5, 0.5)
+    p0.r, p0.c = 0.5, 0.5
+
+    # Attempting UP or LEFT against outer borders produces strictly 0.0 displacement
+    p_up = p0.clone()
+    BombermanPhysics.move_player(p_up, MoveAction.UP, state)
+    assert p_up.r == 0.5 and p_up.c == 0.5
+
+    p_left = p0.clone()
+    BombermanPhysics.move_player(p_left, MoveAction.LEFT, state)
+    assert p_left.r == 0.5 and p_left.c == 0.5
+
+    # Multi-tick idempotence: 10 consecutive ticks pushing into blocked outer wall
+    p_blocked = p0.clone()
+    for _ in range(10):
+        BombermanPhysics.move_player(p_blocked, MoveAction.UP, state)
+        assert p_blocked.r == 0.5 and p_blocked.c == 0.5
+
+    # At bottom-right corner (8, 8), centerline is (8.5, 8.5)
+    p0.r, p0.c = 8.5, 8.5
+    p_down = p0.clone()
+    BombermanPhysics.move_player(p_down, MoveAction.DOWN, state)
+    assert p_down.r == 8.5 and p_down.c == 8.5
+
+    p_right = p0.clone()
+    BombermanPhysics.move_player(p_right, MoveAction.RIGHT, state)
+    assert p_right.r == 8.5 and p_right.c == 8.5
+
+    # Smooth orthogonal alignment: off-axis at r=0.75, c=1.5 moving LEFT
+    p_off = PlayerState(id=0, r=0.75, c=1.5, speed=2.5)
+    step_dist = 2.5 * 0.05  # 0.125
+    BombermanPhysics.move_player(p_off, MoveAction.LEFT, state)
+    # r should nudge toward 0.5 by step_dist: 0.75 - 0.125 = 0.625
+    assert np.isclose(p_off.r, 0.625)
+    assert np.isclose(p_off.c, 1.5 - step_dist)
+
+    # Impassable brick check: at (0, 0) (0.5, 0.5) with brick at (0, 1)
+    from bomberman_rl.rl.action_filter import SafetyActionFilter
+    state.grid[0, 1] = TileType.BRICK
+    p_brick = PlayerState(id=0, r=0.5, c=0.5, speed=2.5)
+    BombermanPhysics.move_player(p_brick, MoveAction.RIGHT, state)
+    assert p_brick.c == 0.5 and p_brick.r == 0.5, "Moving RIGHT into brick wall must produce 0.0 displacement"
+    saf = SafetyActionFilter(enabled=True)
+    mask_brick = saf.get_action_mask(state, player_id=0, ego_perspective=False)
+    assert mask_brick["move_mask"][int(MoveAction.RIGHT)] == False, "RIGHT into brick should be masked"
+
+    # Impassable solid bomb check: at (0, 0) with non-overlapping stationary bomb at (0, 1)
+    state.grid[0, 1] = TileType.EMPTY
+    state.bombs = [BombState(id=99, owner_id=1, r=0.5, c=1.5, timer=50, blast_radius=1)]
+    p_bomb = PlayerState(id=0, r=0.5, c=0.5, speed=2.5, can_kick=False, bomb_pass=False)
+    BombermanPhysics.move_player(p_bomb, MoveAction.RIGHT, state)
+    assert p_bomb.c == 0.5 and p_bomb.r == 0.5, "Moving RIGHT into solid non-overlapping bomb must produce 0.0 displacement"
+    mask_bomb = saf.get_action_mask(state, player_id=0, ego_perspective=False)
+    assert mask_bomb["move_mask"][int(MoveAction.RIGHT)] == False, "RIGHT into solid bomb should be masked"
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Curriculum truncation flag
+# ---------------------------------------------------------------------------
+def _noop_step(env):
+    return env.step([
+        (MoveAction.NOOP, BombAction.NOOP),
+        (MoveAction.NOOP, BombAction.NOOP),
+    ])
+
+
+def test_info_truncated_true_for_curriculum_limit():
+    env = BombermanEnv(seed=42, max_ticks=600)
+    env.state.grid.fill(TileType.EMPTY)
+    env.state.tick = 599
+    _, _, terminated, truncated, info = _noop_step(env)
+    assert truncated and not terminated
+    assert info["truncated"] is True
+
+
+def test_info_truncated_false_for_true_game_limit():
+    env = BombermanEnv(seed=42)
+    env.state.grid.fill(TileType.EMPTY)
+    env.state.tick = MAX_TICKS - 1
+    _, _, _, truncated, info = _noop_step(env)
+    assert truncated
+    assert info["truncated"] is False
+
+
+def test_info_truncated_false_mid_episode_and_on_reset():
+    env = BombermanEnv(seed=42, max_ticks=600)
+    _, reset_info = env.reset(seed=1)
+    assert reset_info["truncated"] is False
+    _, _, _, truncated, info = _noop_step(env)
+    assert not truncated
+    assert info["truncated"] is False

@@ -241,4 +241,18 @@ archive/*
 *.zip
 *.tar
 
+# Agent, Context & Local Development Scratch
+AGENTS.md
+AGENT.md
+CLAUDE.md
+context/
+scratch/
+.antigravity/
+.cursor/
+.claude/
+.aider*
+*.prof
+*.pstats
+
+
 

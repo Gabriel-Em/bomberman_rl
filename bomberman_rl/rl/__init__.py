@@ -15,17 +15,23 @@ from bomberman_rl.rl.rewards import (
     RewardTracker,
     PlayerRewardLog,
     compute_pbrs_potential,
+    compute_danger_potential,
     check_players_connected,
     BRICK_REWARD,
     CONNECTIVITY_REWARD,
     AUXILIARY_REWARD_CAP,
     TERMINAL_WIN,
+    SURVIVAL_BONUS,
     TERMINAL_DRAW,
+    VISITATION_REWARD,
+    FRONTIER_REWARD_WEIGHT,
+    BOMB_WALL_ADJACENT_REWARD,
 )
 from bomberman_rl.rl.action_filter import (
     SafetyActionFilter,
     ActionFilter,
     is_cul_de_sac,
+    is_bomb_placement_safe,
 )
 
 __all__ = [
@@ -41,13 +47,19 @@ __all__ = [
     "RewardTracker",
     "PlayerRewardLog",
     "compute_pbrs_potential",
+    "compute_danger_potential",
     "check_players_connected",
     "BRICK_REWARD",
     "CONNECTIVITY_REWARD",
     "AUXILIARY_REWARD_CAP",
+    "SURVIVAL_BONUS",
+    "VISITATION_REWARD",
+    "FRONTIER_REWARD_WEIGHT",
+    "BOMB_WALL_ADJACENT_REWARD",
     "TERMINAL_WIN",
     "TERMINAL_DRAW",
     "SafetyActionFilter",
     "ActionFilter",
     "is_cul_de_sac",
+    "is_bomb_placement_safe",
 ]

@@ -5,6 +5,9 @@ from bomberman_rl.replays.recorder import (
     ReplayEpisode,
     ReplayRecorder,
     REWARD_COMPONENT_NAMES,
+    find_latest_replay,
+    list_replays,
+    cleanup_replays,
 )
 
 __all__ = [
@@ -12,4 +15,7 @@ __all__ = [
     "ReplayEpisode",
     "ReplayRecorder",
     "REWARD_COMPONENT_NAMES",
+    "find_latest_replay",
+    "list_replays",
+    "cleanup_replays",
 ]
