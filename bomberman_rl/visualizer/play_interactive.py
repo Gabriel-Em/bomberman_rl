@@ -47,6 +47,55 @@ from bomberman_rl.replays.recorder import (
 from bomberman_rl.visualizer.renderer import Renderer
 
 
+MAX_CATCHUP_TICKS_PER_FRAME: int = 3
+
+
+class HumanInputLatch:
+    """Accumulates human key presses across render frames until a simulation tick consumes them.
+
+    Rendering runs faster than the simulation tick rate, so a quick tap can arrive on a frame
+    that does not advance the simulation. The latch keeps the latest move and any bomb press
+    until the next tick.
+    """
+
+    def __init__(self) -> None:
+        self._move: int = int(MoveAction.NOOP)
+        self._bomb: int = int(BombAction.NOOP)
+
+    def update(self, action: tuple[int, int]) -> None:
+        if int(action[0]) != int(MoveAction.NOOP):
+            self._move = int(action[0])
+        if int(action[1]) != int(BombAction.NOOP):
+            self._bomb = int(action[1])
+
+    def consume(self) -> tuple[int, int]:
+        action = (self._move, self._bomb)
+        self._move = int(MoveAction.NOOP)
+        self._bomb = int(BombAction.NOOP)
+        return action
+
+
+def advance_tick_budget(
+    accum: float,
+    dt: float,
+    speed: float,
+    max_ticks: int = MAX_CATCHUP_TICKS_PER_FRAME,
+) -> tuple[int, float]:
+    """Convert elapsed frame time into simulation ticks to run now.
+
+    Returns ``(ticks, remaining_accumulator)``. After a frame hitch at most ``max_ticks`` run
+    and the excess time is discarded so the game never fast-forwards.
+    """
+    if dt <= 0.0:
+        return 0, accum
+    accum += dt * (TICK_RATE * speed)
+    ticks = int(accum)
+    accum -= ticks
+    if ticks > max_ticks:
+        ticks = max_ticks
+    return ticks, accum
+
+
 class HeuristicAgent:
     """Intelligent rule-based opponent with genuine policy distributions and critic estimates."""
 
@@ -170,8 +219,9 @@ def run_interactive(
     replays_dir: str = "./replays",
 ) -> None:
     """Run interactive visual loop for live gameplay or replay inspection."""
-    renderer = Renderer(title=f"Bomberman MARL - {mode.upper()}", headless=headless)
+    renderer = Renderer(title=f"Bomberman MARL - {mode.upper()}", headless=headless, mode=mode)
     renderer.max_ticks = max_ticks
+    renderer.set_playback_speed(playback_speed)
 
     # --- Mode: Replay Forensic Analyzer ---
     if mode == "replay":
@@ -253,6 +303,7 @@ def run_interactive(
     running = True
     terminated = False
     subtick_accum = 0.0
+    human_latch = HumanInputLatch()
 
     # Record initial frame
     danger_map = compute_danger_map(state)
@@ -295,16 +346,21 @@ def run_interactive(
         elif inp["step"] != 0 and renderer.paused:
             live_scrub_index = int(np.clip(live_scrub_index + inp["step"], 0, total_frames - 1))
 
+        human_latch.update(inp["human_action"])
+        if renderer.paused:
+            human_latch.consume()
+
         # Simulation step when unpaused
         if not renderer.paused and not terminated:
-            subtick_accum += dt * (TICK_RATE * renderer.playback_speed)
-            while subtick_accum >= 1.0 and not terminated:
-                subtick_accum -= 1.0
+            ticks_due, subtick_accum = advance_tick_budget(subtick_accum, dt, renderer.playback_speed)
+            for _ in range(ticks_due):
+                if terminated:
+                    break
                 danger_map = compute_danger_map(state)
 
                 # Compute actions
                 if mode == "human_vs_agent":
-                    p0_act = inp["human_action"]
+                    p0_act = human_latch.consume()
                     p0_probs = np.zeros(10, dtype=np.float32)
                     p0_probs[int(p0_act[0])] = 1.0
                     p0_probs[5 + int(p0_act[1])] = 1.0

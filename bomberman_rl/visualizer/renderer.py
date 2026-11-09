@@ -89,12 +89,14 @@ class Renderer:
         surface: pygame.Surface | None = None,
         title: str = "Bomberman RL Telemetry & Diagnostics",
         headless: bool = False,
+        mode: str = "agent_vs_agent",
     ) -> None:
         if not pygame.get_init():
             pygame.init()
         if not pygame.font.get_init():
             pygame.font.init()
 
+        self.mode = mode
         self.headless = headless
         if surface is not None:
             self.screen = surface
@@ -160,6 +162,13 @@ class Renderer:
     @property
     def playback_speed(self) -> float:
         return self.speed_multipliers[self.speed_idx]
+
+    def set_playback_speed(self, speed: float) -> None:
+        """Select the supported playback multiplier nearest to ``speed``."""
+        self.speed_idx = min(
+            range(len(self.speed_multipliers)),
+            key=lambda i: abs(self.speed_multipliers[i] - speed),
+        )
 
     # --- Procedural Texture Generation ---
     def _create_outer_brick_texture(self) -> pygame.Surface:
@@ -548,6 +557,8 @@ class Renderer:
             self._last_sparkline_tick = state.tick
 
         if not self.show_telemetry:
+            self._render_player_inventory(surface, rx + 20, 20, 0, state.players[0])
+            self._render_player_inventory(surface, rx + 20, 80, 1, state.players[1])
             hint = self.font_md.render("Press T to show neural telemetry", True, COLOR_TEXT_MUTED)
             surface.blit(hint, hint.get_rect(center=(rx + (self.WINDOW_WIDTH - rx) // 2, self.ARENA_SIZE // 2)))
             return
@@ -624,6 +635,33 @@ class Renderer:
             pygame.draw.lines(surface, COLOR_P0_CYAN, False, pts0, 2)
             pygame.draw.lines(surface, COLOR_P1_RED, False, pts1, 2)
 
+    def _render_inventory_line(self, surface: pygame.Surface, x: int, y: int, player: PlayerState) -> None:
+        """Draw the bombs / radius / speed / perks summary for one player."""
+        b_text = f"Bombs: {player.max_bombs} max | Radius: {player.blast_radius} | Speed: {player.speed:.1f}"
+        perks = []
+        if player.can_kick:
+            perks.append("[KICK]")
+        if player.bomb_pass:
+            perks.append("[PASS]")
+        if player.shield_timer > 0:
+            perks.append(f"[SHLD {player.shield_timer / 20.0:.1f}s]")
+        perk_str = " ".join(perks) if perks else "[NONE]"
+        inv_lbl = self.font_sm.render(f"{b_text} | Perks: {perk_str}", True, COLOR_TEXT_PRIMARY)
+        surface.blit(inv_lbl, (x, y))
+
+    def _render_player_inventory(
+        self, surface: pygame.Surface, x: int, y: int, pid: int, player: PlayerState
+    ) -> None:
+        """Compact per-player header plus inventory, shown while the full telemetry is hidden."""
+        is_p0 = pid == 0
+        theme_col = COLOR_P0_CYAN if is_p0 else COLOR_P1_RED
+        name = "PLAYER 0 (CYAN)" if is_p0 else "PLAYER 1 (CRIMSON)"
+        status = "ALIVE" if player.alive else "ELIMINATED"
+        status_col = COLOR_GREEN if player.alive else (220, 50, 50)
+        surface.blit(self.font_md.render(name, True, theme_col), (x, y))
+        surface.blit(self.font_md.render(f"[{status}]", True, status_col), (x + 180, y))
+        self._render_inventory_line(surface, x, y + 22, player)
+
     def _render_player_telemetry(
         self,
         surface: pygame.Surface,
@@ -646,20 +684,7 @@ class Renderer:
         surface.blit(stat_lbl, (x + 180, y))
 
         # 1. Live Inventory Bar
-        b_active = 0
-        if telemetry:
-            pass
-        b_text = f"Bombs: {player.max_bombs} max | Radius: {player.blast_radius} | Speed: {player.speed:.1f}"
-        perks = []
-        if player.can_kick:
-            perks.append("[KICK]")
-        if player.bomb_pass:
-            perks.append("[PASS]")
-        if player.shield_timer > 0:
-            perks.append(f"[SHLD {player.shield_timer / 20.0:.1f}s]")
-        perk_str = " ".join(perks) if perks else "[NONE]"
-        inv_lbl = self.font_sm.render(f"{b_text} | Perks: {perk_str}", True, COLOR_TEXT_PRIMARY)
-        surface.blit(inv_lbl, (x, y + 22))
+        self._render_inventory_line(surface, x, y + 22, player)
 
         # 2. Action Probability Bars
         probs = None
@@ -831,7 +856,10 @@ class Renderer:
         speed_lbl = self.font_md.render(speed_str, True, COLOR_TEXT_PRIMARY)
         surface.blit(speed_lbl, (520, panel_y + 12))
 
-        help_str = "Controls: SPACE: Pause | LEFT/RIGHT: Jump ±5s (Step ±1 when paused) | UP/DOWN: Speed | T: Telemetry | 1-3: Overlays"
+        if getattr(self, "mode", "agent_vs_agent") == "human_vs_agent":
+            help_str = "Controls: WASD: Move | SPACE: Bomb | P: Pause | LEFT/RIGHT: Jump ±5s | UP/DOWN: Speed | T: Telemetry | 1-3: Overlays"
+        else:
+            help_str = "Controls: SPACE/P: Pause | LEFT/RIGHT: Jump ±5s (Step ±1 when paused) | UP/DOWN: Speed | T: Telemetry | 1-3: Overlays"
         help_lbl = self.font_xs.render(help_str, True, COLOR_TEXT_MUTED)
         surface.blit(help_lbl, (660, panel_y + 14))
 
@@ -889,8 +917,9 @@ class Renderer:
             surface.blit(tip_surf, tip_rect)
 
     # --- Interaction & Event Handling ---
-    def handle_input(self) -> dict[str, Any]:
+    def handle_input(self, mode: str | None = None) -> dict[str, Any]:
         """Handle keyboard shortcuts, overlays, and mouse dragging."""
+        effective_mode = mode if mode is not None else getattr(self, "mode", "agent_vs_agent")
         events_processed = {
             "quit": False,
             "toggle_pause": False,
@@ -914,7 +943,7 @@ class Renderer:
         elif keys[pygame.K_d] or keys[pygame.K_RIGHT]:
             move_act = MoveAction.RIGHT
 
-        if keys[pygame.K_SPACE]:
+        if keys[pygame.K_SPACE] or keys[pygame.K_b] or keys[pygame.K_RETURN]:
             bomb_act = BombAction.PLACE_BOMB
 
         events_processed["human_action"] = (move_act, bomb_act)
@@ -929,19 +958,57 @@ class Renderer:
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     events_processed["quit"] = True
-                elif event.key == pygame.K_SPACE:
+                elif event.key in (pygame.K_p, getattr(pygame, "K_PAUSE", -1)):
                     self.paused = not self.paused
                     events_processed["toggle_pause"] = True
+                elif event.key == pygame.K_SPACE:
+                    if effective_mode == "human_vs_agent":
+                        bomb_act = BombAction.PLACE_BOMB
+                        events_processed["human_action"] = (move_act, bomb_act)
+                    else:
+                        self.paused = not self.paused
+                        events_processed["toggle_pause"] = True
+                elif event.key in (pygame.K_b, pygame.K_RETURN) and effective_mode == "human_vs_agent":
+                    bomb_act = BombAction.PLACE_BOMB
+                    events_processed["human_action"] = (move_act, bomb_act)
                 elif event.key == pygame.K_LEFT:
-                    events_processed["step"] = -1 if self.paused else -5 * TICK_RATE
+                    if effective_mode == "human_vs_agent":
+                        move_act = MoveAction.LEFT
+                        events_processed["human_action"] = (move_act, bomb_act)
+                    else:
+                        events_processed["step"] = -1 if self.paused else -5 * TICK_RATE
                 elif event.key == pygame.K_RIGHT:
-                    events_processed["step"] = 1 if self.paused else 5 * TICK_RATE
+                    if effective_mode == "human_vs_agent":
+                        move_act = MoveAction.RIGHT
+                        events_processed["human_action"] = (move_act, bomb_act)
+                    else:
+                        events_processed["step"] = 1 if self.paused else 5 * TICK_RATE
                 elif event.key == pygame.K_UP:
-                    self.speed_idx = min(len(self.speed_multipliers) - 1, self.speed_idx + 1)
-                    events_processed["speed_change"] = 1
+                    if effective_mode == "human_vs_agent":
+                        move_act = MoveAction.UP
+                        events_processed["human_action"] = (move_act, bomb_act)
+                    else:
+                        self.speed_idx = min(len(self.speed_multipliers) - 1, self.speed_idx + 1)
+                        events_processed["speed_change"] = 1
                 elif event.key == pygame.K_DOWN:
-                    self.speed_idx = max(0, self.speed_idx - 1)
-                    events_processed["speed_change"] = -1
+                    if effective_mode == "human_vs_agent":
+                        move_act = MoveAction.DOWN
+                        events_processed["human_action"] = (move_act, bomb_act)
+                    else:
+                        self.speed_idx = max(0, self.speed_idx - 1)
+                        events_processed["speed_change"] = -1
+                elif event.key == pygame.K_w and effective_mode == "human_vs_agent":
+                    move_act = MoveAction.UP
+                    events_processed["human_action"] = (move_act, bomb_act)
+                elif event.key == pygame.K_s and effective_mode == "human_vs_agent":
+                    move_act = MoveAction.DOWN
+                    events_processed["human_action"] = (move_act, bomb_act)
+                elif event.key == pygame.K_a and effective_mode == "human_vs_agent":
+                    move_act = MoveAction.LEFT
+                    events_processed["human_action"] = (move_act, bomb_act)
+                elif event.key == pygame.K_d and effective_mode == "human_vs_agent":
+                    move_act = MoveAction.RIGHT
+                    events_processed["human_action"] = (move_act, bomb_act)
                 # Overlays (Keys 1, 2, 3, 4)
                 elif event.key == pygame.K_1:
                     self.overlay_danger = not self.overlay_danger

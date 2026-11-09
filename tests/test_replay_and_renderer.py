@@ -43,7 +43,12 @@ from bomberman_rl.visualizer.renderer import (
     COLOR_P0_CYAN,
     COLOR_P1_RED,
 )
-from bomberman_rl.visualizer.play_interactive import HeuristicAgent, run_interactive
+from bomberman_rl.visualizer.play_interactive import (
+    HeuristicAgent,
+    HumanInputLatch,
+    advance_tick_budget,
+    run_interactive,
+)
 
 
 class TestHeadlessSurfaceRendering:
@@ -342,6 +347,34 @@ class TestReplayAndScrubberDetails:
         on = pygame.image.tostring(renderer.screen, "RGB")
         assert off != on
 
+    def test_inventory_visible_in_right_panel_while_telemetry_hidden(self) -> None:
+        renderer = Renderer(headless=True)
+        assert renderer.show_telemetry is False
+        panel = pygame.Rect(renderer.ARENA_SIZE, 0, renderer.WINDOW_WIDTH - renderer.ARENA_SIZE, renderer.ARENA_SIZE)
+
+        def panel_pixels(state: GameState) -> bytes:
+            renderer.render_right_panel(renderer.screen, state, None)
+            return pygame.image.tostring(renderer.screen.subsurface(panel), "RGB")
+
+        base = GameState.create_initial()
+        baseline = panel_pixels(base)
+        for pid in (0, 1):
+            for attr, value in (("max_bombs", 5), ("speed", 3.5), ("can_kick", True), ("bomb_pass", True), ("shield_timer", 40)):
+                state = GameState.create_initial()
+                setattr(state.players[pid], attr, value)
+                assert panel_pixels(state) != baseline, f"P{pid} {attr} not shown"
+
+    def test_hidden_panel_omits_action_probability_detail(self) -> None:
+        renderer = Renderer(headless=True)
+        state = GameState.create_initial()
+        telem_a = {"action_probs_p0": [1, 0, 0, 0, 0, 1, 0], "actions": {"player_0": (0, 0)}}
+        telem_b = {"action_probs_p0": [0, 0, 0, 0, 1, 0, 1], "actions": {"player_0": (4, 1)}}
+        renderer.render_right_panel(renderer.screen, state, telem_a)
+        a = pygame.image.tostring(renderer.screen, "RGB")
+        renderer.render_right_panel(renderer.screen, state, telem_b)
+        b = pygame.image.tostring(renderer.screen, "RGB")
+        assert a == b
+
     def test_particle_lifespan_and_gravity(self) -> None:
         p = BrickParticle(x=10.0, y=10.0, vx=1.0, vy=-2.0, size=4.0, color=(180, 80, 60), lifetime=10)
         for frame in range(10):
@@ -627,6 +660,189 @@ class TestReplaySparklineAndPlaybackControls:
         assert len(renderer.v_history_p0) == 31
         assert abs(renderer.v_history_p0[-1] - 0.30) < 1e-5
 
+    def test_human_vs_agent_space_places_bomb_without_pausing(self) -> None:
+        """Verify that in human_vs_agent mode, pressing SPACE places a bomb and does NOT toggle pause."""
+        renderer = Renderer(headless=True, mode="human_vs_agent")
+        assert renderer.paused is False
+
+        # Post SPACE key press
+        pygame.event.clear()
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE))
+        inp = renderer.handle_input()
+
+        # In human_vs_agent mode, SPACE must place a bomb and must NOT toggle pause
+        assert inp["toggle_pause"] is False
+        assert renderer.paused is False
+        assert inp["human_action"][1] == BombAction.PLACE_BOMB
+
+        # Pressing 'P' toggles pause in human_vs_agent mode
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_p))
+        inp_p = renderer.handle_input()
+        assert inp_p["toggle_pause"] is True
+        assert renderer.paused is True
+
+        # Pressing 'P' again unpauses
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_p))
+        inp_p2 = renderer.handle_input()
+        assert inp_p2["toggle_pause"] is True
+        assert renderer.paused is False
+
+    def test_non_human_mode_space_toggles_pause(self) -> None:
+        """Verify that in agent_vs_agent / replay modes, SPACE still toggles pause."""
+        renderer = Renderer(headless=True, mode="agent_vs_agent")
+        assert renderer.paused is False
+
+        pygame.event.clear()
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE))
+        inp = renderer.handle_input()
+        assert inp["toggle_pause"] is True
+        assert renderer.paused is True
+
+        # P also toggles pause in agent_vs_agent mode
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_p))
+        inp_p = renderer.handle_input()
+        assert inp_p["toggle_pause"] is True
+        assert renderer.paused is False
+
+    def test_human_vs_agent_movement_and_alternative_bomb_keys(self) -> None:
+        """Verify WASD movement keys, alternative bomb keys (B, RETURN), and K_PAUSE."""
+        renderer = Renderer(headless=True, mode="human_vs_agent")
+
+        # Movement keys WASD
+        for key, expected_move in [
+            (pygame.K_w, MoveAction.UP),
+            (pygame.K_s, MoveAction.DOWN),
+            (pygame.K_a, MoveAction.LEFT),
+            (pygame.K_d, MoveAction.RIGHT),
+        ]:
+            pygame.event.clear()
+            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=key))
+            inp = renderer.handle_input()
+            assert inp["human_action"][0] == expected_move
+            assert inp["toggle_pause"] is False
+
+        # Alternative bomb keys: B and RETURN
+        for key in [pygame.K_b, pygame.K_RETURN]:
+            pygame.event.clear()
+            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=key))
+            inp = renderer.handle_input()
+            assert inp["human_action"][1] == BombAction.PLACE_BOMB
+            assert inp["toggle_pause"] is False
+            assert renderer.paused is False
+
+        # K_PAUSE key support
+        pygame.event.clear()
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_PAUSE))
+        inp = renderer.handle_input()
+        assert inp["toggle_pause"] is True
+        assert renderer.paused is True
+
+    def test_mode_override_in_handle_input_and_render_panel(self) -> None:
+        """Verify explicit mode argument to handle_input and render_frame across modes."""
+        renderer = Renderer(headless=True, mode="agent_vs_agent")
+
+        # Overriding mode in handle_input to human_vs_agent prevents SPACE from pausing
+        pygame.event.clear()
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE))
+        inp = renderer.handle_input(mode="human_vs_agent")
+        assert inp["toggle_pause"] is False
+        assert renderer.paused is False
+        assert inp["human_action"][1] == BombAction.PLACE_BOMB
+
+        # Render bottom panel in human_vs_agent mode and agent_vs_agent mode
+        state = GameState.create_initial(seed=42)
+        renderer.mode = "human_vs_agent"
+        renderer.render_frame(state=state)
+
+        renderer.mode = "agent_vs_agent"
+        renderer.render_frame(state=state)
+
+    def test_human_vs_agent_interactive_headless_simulation(self) -> None:
+        """Verify run_interactive in human_vs_agent mode executes ticks without pausing unexpectedly."""
+        # Run 5 ticks human vs agent headless
+        run_interactive(
+            mode="human_vs_agent",
+            seed=42,
+            headless=True,
+            max_ticks=5,
+        )
 
 
 
+
+
+
+
+
+class TestHumanPlayInputAndTiming:
+    """Human-vs-agent controls must be independent of playback controls and survive the 60fps/20Hz mismatch."""
+
+    def test_human_arrow_keys_move_without_changing_playback_speed(self) -> None:
+        renderer = Renderer(headless=True, mode="human_vs_agent")
+        start_idx = renderer.speed_idx
+        for key, expected in [(pygame.K_UP, MoveAction.UP), (pygame.K_DOWN, MoveAction.DOWN)]:
+            for _ in range(5):
+                pygame.event.clear()
+                pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=key))
+                inp = renderer.handle_input()
+                assert inp["human_action"][0] == expected
+                assert inp["speed_change"] == 0
+        assert renderer.speed_idx == start_idx
+        assert renderer.playback_speed == 1.0
+
+    def test_human_left_right_do_not_request_replay_seek_steps(self) -> None:
+        renderer = Renderer(headless=True, mode="human_vs_agent")
+        for key in (pygame.K_LEFT, pygame.K_RIGHT):
+            pygame.event.clear()
+            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=key))
+            assert renderer.handle_input()["step"] == 0
+
+    def test_non_human_arrow_up_down_still_change_speed(self) -> None:
+        renderer = Renderer(headless=True, mode="agent_vs_agent")
+        pygame.event.clear()
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_UP))
+        renderer.handle_input()
+        assert renderer.playback_speed == 2.0
+
+    def test_latch_keeps_tap_until_consumed(self) -> None:
+        latch = HumanInputLatch()
+        latch.update((MoveAction.NOOP, BombAction.PLACE_BOMB))
+        latch.update((MoveAction.NOOP, BombAction.NOOP))  # later frame with no key
+        assert latch.consume() == (MoveAction.NOOP, BombAction.PLACE_BOMB)
+        assert latch.consume() == (MoveAction.NOOP, BombAction.NOOP)
+
+    def test_latch_latest_move_wins_and_bomb_is_or(self) -> None:
+        latch = HumanInputLatch()
+        latch.update((MoveAction.LEFT, BombAction.NOOP))
+        latch.update((MoveAction.RIGHT, BombAction.PLACE_BOMB))
+        latch.update((MoveAction.NOOP, BombAction.NOOP))
+        assert latch.consume() == (MoveAction.RIGHT, BombAction.PLACE_BOMB)
+
+    def test_latch_empty_consume_is_noop(self) -> None:
+        assert HumanInputLatch().consume() == (MoveAction.NOOP, BombAction.NOOP)
+
+    def test_tick_budget_normal_frame(self) -> None:
+        n, rem = advance_tick_budget(0.0, 1 / 60, 1.0)
+        assert n == 0 and abs(rem - 1 / 3) < 1e-9
+        n, rem = advance_tick_budget(0.9, 1 / 60, 1.0)
+        assert n == 1 and abs(rem - (0.9 + 1 / 3 - 1.0)) < 1e-9
+
+    def test_tick_budget_caps_catchup_after_frame_hitch(self) -> None:
+        # A 1-second stall would be 20 ticks; must be capped and leftover discarded.
+        n, rem = advance_tick_budget(0.0, 1.0, 1.0)
+        assert n == 3
+        assert 0.0 <= rem < 1.0
+
+    def test_tick_budget_zero_and_negative_dt(self) -> None:
+        assert advance_tick_budget(0.25, 0.0, 1.0) == (0, 0.25)
+        n, rem = advance_tick_budget(0.25, -1.0, 1.0)
+        assert n == 0 and rem == 0.25
+
+    def test_set_playback_speed_snaps_to_nearest_supported(self) -> None:
+        renderer = Renderer(headless=True)
+        renderer.set_playback_speed(4.0)
+        assert renderer.playback_speed == 4.0
+        renderer.set_playback_speed(0.3)
+        assert renderer.playback_speed == 0.25
+        renderer.set_playback_speed(100.0)
+        assert renderer.playback_speed == 4.0
